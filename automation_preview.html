@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AuroraDrive · 自动化预览</title>
+<style>
+  :root{
+    --bg:#000000;
+    --card:rgba(255,255,255,0.045);
+    --card-edge:rgba(255,255,255,0.08);
+    --cyan:#00E5FF;
+    --cyan-dim:rgba(0,229,255,0.55);
+    --orange:#FF5C38;
+    --danger:#FF3D47;
+    --t1:#ffffff;
+    --t2:rgba(255,255,255,0.62);
+    --t3:rgba(255,255,255,0.38);
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;}
+  body{
+    background:var(--bg);
+    color:var(--t1);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC",sans-serif;
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  .app{display:flex;flex-direction:column;height:100vh;}
+  /* 顶栏 */
+  .topbar{
+    height:48px;display:flex;align-items:center;gap:12px;padding:0 18px;
+    border-bottom:1px solid var(--card-edge);
+    background:rgba(255,255,255,0.02);
+  }
+  .logo{color:var(--cyan);font-weight:700;letter-spacing:1px;font-size:16px;
+    text-shadow:0 0 12px var(--cyan-dim);}
+  .topbar .sub{color:var(--t3);font-size:12px;}
+  .topbar .spacer{flex:1;}
+  .pill{font-size:11px;color:var(--cyan);border:1px solid var(--cyan-dim);
+    padding:3px 10px;border-radius:20px;box-shadow:0 0 10px rgba(0,229,255,0.15) inset;}
+  /* 主体 */
+  .main{flex:1;display:flex;min-height:0;}
+  .stage{flex:1;position:relative;padding:16px;min-width:0;}
+  /* 驾驶画面（默认态） */
+  .drive{position:absolute;inset:16px;border:1px solid var(--card-edge);border-radius:14px;
+    background:
+      radial-gradient(120% 80% at 50% 0%, rgba(0,229,255,0.06), transparent 60%),
+      rgba(255,255,255,0.02);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;}
+  .drive .road{width:60%;height:3px;background:linear-gradient(90deg,transparent,var(--cyan),transparent);
+    box-shadow:0 0 14px var(--cyan-dim);}
+  .drive .hud{display:flex;gap:40px;}
+  .drive .metric{text-align:center;}
+  .drive .metric .v{font-size:34px;font-weight:700;color:var(--cyan);text-shadow:0 0 16px var(--cyan-dim);}
+  .drive .metric .k{font-size:11px;color:var(--t3);margin-top:2px;letter-spacing:1px;}
+  .drive .tag{color:var(--t2);font-size:13px;letter-spacing:2px;}
+  /* 自动化界面（激活态） */
+  .auto{position:absolute;inset:16px;border:1px solid var(--card-edge);border-radius:14px;
+    background:rgba(255,255,255,0.02);display:none;flex-direction:column;}
+  .auto.on{display:flex;}
+  .auto-head{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--card-edge);}
+  .auto-head .title{font-size:15px;font-weight:600;letter-spacing:1px;}
+  .auto-head .title b{color:var(--cyan);text-shadow:0 0 10px var(--cyan-dim);}
+  .auto-head .back{margin-left:auto;font-size:12px;color:var(--t2);border:1px solid var(--card-edge);
+    padding:5px 12px;border-radius:8px;cursor:pointer;}
+  .auto-head .back:hover{border-color:var(--cyan-dim);color:var(--cyan);}
+  .auto-head .warn{font-size:11px;color:var(--orange);border:1px solid rgba(255,92,56,0.4);
+    padding:3px 10px;border-radius:20px;}
+  .grid{flex:1;overflow:auto;padding:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:14px;align-content:start;}
+  .card{background:var(--card);border:1px solid var(--card-edge);border-radius:12px;padding:14px 16px;
+    display:flex;flex-direction:column;gap:10px;transition:.15s;}
+  .card:hover{border-color:var(--cyan-dim);}
+  .card .row1{display:flex;align-items:center;gap:10px;}
+  .card .emoji{font-size:20px;filter:drop-shadow(0 0 8px var(--cyan-dim));}
+  .card .name{font-size:14px;font-weight:600;}
+  .card .desc{font-size:11px;color:var(--t3);margin-top:-4px;}
+  .card .opts{display:flex;flex-direction:column;gap:7px;padding-left:2px;}
+  .opt{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t2);}
+  .opt input[type=text]{background:rgba(0,0,0,0.4);border:1px solid var(--card-edge);color:var(--t1);
+    border-radius:6px;padding:3px 8px;width:70px;font-size:12px;}
+  .opt select{background:rgba(0,0,0,0.4);border:1px solid var(--card-edge);color:var(--t1);
+    border-radius:6px;padding:3px 6px;font-size:12px;}
+  .opt .midi{background:rgba(0,229,255,0.08);border:1px solid var(--cyan-dim);color:var(--cyan);
+    border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;}
+  /* 开关 */
+  .sw{position:relative;width:38px;height:21px;border-radius:20px;background:rgba(255,255,255,0.1);
+    border:1px solid var(--card-edge);cursor:pointer;transition:.18s;flex:none;}
+  .sw::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;
+    background:#fff;transition:.18s;}
+  .sw.on{background:var(--cyan);box-shadow:0 0 12px var(--cyan-dim);border-color:var(--cyan);}
+  .sw.on::after{left:19px;}
+  .card .row1 .sw{margin-left:auto;}
+  /* 右侧栏 */
+  .sidebar{width:288px;flex:none;border-left:1px solid var(--card-edge);
+    background:rgba(255,255,255,0.02);display:flex;flex-direction:column;padding:14px;gap:10px;}
+  .side-title{font-size:11px;color:var(--t3);letter-spacing:2px;margin-bottom:2px;}
+  .side-card{background:var(--card);border:1px solid var(--card-edge);border-radius:10px;padding:12px;
+    display:flex;flex-direction:column;gap:8px;}
+  .side-card .lbl{font-size:12px;color:var(--t2);}
+  .side-card .val{font-size:13px;color:var(--cyan);}
+  .side-spacer{flex:1;}
+  .btn{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:10px;cursor:pointer;
+    border:1px solid var(--card-edge);background:var(--card);color:var(--t1);font-size:13px;transition:.15s;}
+  .btn:hover{border-color:var(--cyan-dim);}
+  .btn .ic{font-size:18px;}
+  .btn.auto{border-color:rgba(0,229,255,0.35);background:rgba(0,229,255,0.06);color:var(--cyan);
+    box-shadow:0 0 14px rgba(0,229,255,0.12);}
+  .btn.auto:hover{box-shadow:0 0 20px rgba(0,229,255,0.22);}
+  .foot{font-size:10px;color:var(--t3);text-align:center;padding-top:4px;}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <span class="logo">AURORADRIVE</span>
+    <span class="sub">异环自动辅助 · 驾驶舱</span>
+    <span class="spacer"></span>
+    <span class="pill">预览版 · 逻辑未接入</span>
+  </div>
+
+  <div class="main">
+    <!-- 左：大舞台 -->
+    <div class="stage">
+      <!-- 默认：驾驶画面 -->
+      <div class="drive" id="driveView">
+        <div class="tag">驾驶画面 · DRIVE</div>
+        <div class="hud">
+          <div class="metric"><div class="v">63</div><div class="k">KM/H</div></div>
+          <div class="metric"><div class="v">+0.02</div><div class="k">STEER</div></div>
+          <div class="metric"><div class="v">E2E</div><div class="k">MODE</div></div>
+        </div>
+        <div class="road"></div>
+        <div class="tag" style="color:var(--t3)">点右侧「自动化」切换操作界面 →</div>
+      </div>
+
+      <!-- 激活：自动化界面 -->
+      <div class="auto" id="autoView">
+        <div class="auto-head">
+          <span class="title"><b>MaaNTE</b> 自动化操作</span>
+          <span class="warn">⚠ 预览 · 真实识别未接入</span>
+          <span class="back" onclick="setMode('drive')">← 返回驾驶</span>
+        </div>
+        <div class="grid" id="grid"></div>
+      </div>
+    </div>
+
+    <!-- 右：侧边栏 -->
+    <div class="sidebar">
+      <div class="side-title">状态</div>
+      <div class="side-card">
+        <div class="lbl">当前模式</div>
+        <div class="val" id="modeVal">驾驶辅助</div>
+        <div class="lbl">帧率</div>
+        <div class="val">30 FPS</div>
+      </div>
+      <div class="side-spacer"></div>
+      <div class="side-title">快捷</div>
+      <div class="btn"><span class="ic">🗺️</span><span>打开异环地图</span></div>
+      <div class="btn auto" onclick="setMode('auto')"><span class="ic">🤖</span><span>自动化</span></div>
+      <div class="foot">AuroraDrive · FSD Cockpit</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // 全部功能（全移植意图，逻辑后续接）
+  const FEATURES = [
+    {emoji:"🎣",name:"自动钓鱼",desc:"识别浮标/鱼竿状态→点按",opts:[
+      {t:"switch",k:"自动卖鱼"},{t:"switch",k:"自动买鱼饵"}]},
+    {emoji:"🥤",name:"自动做咖啡",desc:"识别咖啡机状态→制作",opts:[
+      {t:"switch",k:"驱赶所有顾客"}]},
+    {emoji:"🐾",name:"粉爪大劫案",desc:"自动刷副本·战斗·撤离（最凶）",opts:[
+      {t:"text",k:"循环次数",ph:"如 5"},{t:"select",k:"地图方案",items:["方案一（默认）"]}]},
+    {emoji:"🪑",name:"自动收家具",desc:"五处公寓家具收取",opts:[
+      {t:"check",k:"维纳"},{t:"check",k:"伊登"},{t:"check",k:"天景"},{t:"check",k:"金都"},{t:"check",k:"峰林"}]},
+    {emoji:"💎",name:"自动领奖励",desc:"活跃度 / 环期赏令",opts:[
+      {t:"switch",k:"活跃度"},{t:"switch",k:"环期赏令"}]},
+    {emoji:"🎹",name:"自动弹钢琴",desc:"MIDI 序列演奏",opts:[
+      {t:"midi",k:"导入 MIDI"}]},
+    {emoji:"🎵",name:"自动超强音",desc:"循环演奏迷星叫",opts:[
+      {t:"switch",k:"循环演奏"}]},
+    {emoji:"⚔️",name:"自动闪避",desc:"音频识别闪避/反击",opts:[
+      {t:"switch",k:"启用音频识别"}]},
+    {emoji:"🕛",name:"实时辅助",desc:"传送/跳剧情/拾取",opts:[
+      {t:"switch",k:"自动传送"},{t:"switch",k:"自动跳剧情"},{t:"switch",k:"自动拾取"}]},
+  ];
+
+  const grid = document.getElementById('grid');
+  FEATURES.forEach(f=>{
+    const card = document.createElement('div'); card.className='card';
+    let optsHtml = f.opts.map(o=>{
+      if(o.t==='switch') return `<label class="opt"><span class="sw" onclick="this.classList.toggle('on')"></span>${o.k}</label>`;
+      if(o.t==='check')  return `<label class="opt"><span class="sw" onclick="this.classList.toggle('on')"></span>${o.k}</label>`;
+      if(o.t==='text')   return `<label class="opt">${o.k}<input type="text" placeholder="${o.ph||''}"></label>`;
+      if(o.t==='select') return `<label class="opt">${o.k}<select>${o.items.map(i=>`<option>${i}</option>`).join('')}</select></label>`;
+      if(o.t==='midi')   return `<label class="opt">${o.k}<span class="midi">选择文件…</span></label>`;
+      return '';
+    }).join('');
+    card.innerHTML = `
+      <div class="row1">
+        <span class="emoji">${f.emoji}</span>
+        <div><div class="name">${f.name}</div></div>
+        <span class="sw" onclick="this.classList.toggle('on')"></span>
+      </div>
+      <div class="desc">${f.desc}</div>
+      <div class="opts">${optsHtml}</div>`;
+    grid.appendChild(card);
+  });
+
+  function setMode(m){
+    const auto = document.getElementById('autoView');
+    const drive = document.getElementById('driveView');
+    const modeVal = document.getElementById('modeVal');
+    if(m==='auto'){ auto.classList.add('on'); drive.style.display='none'; modeVal.textContent='自动化操作'; }
+    else { auto.classList.remove('on'); drive.style.display='flex'; modeVal.textContent='驾驶辅助'; }
+  }
+</script>
+</body>
+</html>

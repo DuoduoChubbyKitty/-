@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "/Users/dupi/Desktop/自动驾驶系统/src/train_game_assist.py", line 460, in main
+    results["control"] = train_game_assist_control(
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/dupi/Desktop/自动驾驶系统/src/train_game_assist.py", line 326, in train_game_assist_control
+    best_path = train_mono(
+                ^^^^^^^^^^^
+  File "/Users/dupi/Desktop/自动驾驶系统/src/train_mono.py", line 140, in train_mono
+    train_dataset = MonoClipsDataset(
+                    ^^^^^^^^^^^^^^^^^
+  File "/Users/dupi/Desktop/自动驾驶系统/src/mono_dataset.py", line 183, in __init__
+    raise RuntimeError(f"未在 {self.clips_dir} 找到任何 clip_* 目录")
+RuntimeError: 未在 /Users/dupi/Desktop/自动驾驶系统/data/raw_clips 找到任何 clip_* 目录
+
+============================================================
+[M9-Mono] 训练 | device=mps | epochs=30 | batch=8×2
+============================================================
+
+  ⚠ 控制模型训练失败: 未在 /Users/dupi/Desktop/自动驾驶系统/data/raw_clips 找到任何 clip_* 目录
+[FPV] 没有 FPV 训练数据，跳过 FPV 控制模型训练
+
+============================================================
+✅ 游戏辅助模型训练全部完成
+============================================================
+  control_fpv: None

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>车道线标注工具 Lane Annotator (自由曲线)</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, "PingFang SC", sans-serif; margin:0; background:#1e1e1e; color:#ddd; }
+  #bar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; padding:8px 12px; background:#2a2a2a; border-bottom:1px solid #444; }
+  #bar button,#bar label { background:#3a3a3a; color:#eee; border:1px solid #555; border-radius:6px; padding:6px 10px; cursor:pointer; font-size:13px; }
+  #bar button:hover { background:#4a4a4a; }
+  #bar .active { background:#ffcc00; color:#000; font-weight:700; }
+  #wrap { display:flex; justify-content:center; padding:12px; overflow:auto; }
+  canvas { background:#000; max-width:96vw; touch-action:none; cursor:crosshair; }
+  #info { padding:4px 12px; font-size:12px; color:#aaa; }
+  .hint { color:#888; font-size:12px; padding:2px 12px 8px; }
+  .hint b { color:#ffcc00; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <label>加载图片<input id="fileInput" type="file" multiple accept="image/*" hidden></label>
+  <label>加载文件夹(录制帧)<input id="dirInput" type="file" webkitdirectory hidden></label>
+  <button id="undoBtn">撤销点(Z)</button>
+  <button id="clearBtn">清空本图(C)</button>
+  <button id="finishBtn">完成本线(回车)</button>
+  <button id="prevBtn">上一张(←)</button>
+  <button id="nextBtn">下一张(→)</button>
+  <button id="exportBtn">导出JSON</button>
+  <label>导入JSON<input id="importInput" type="file" accept="application/json" hidden></label>
+  <input id="jumpInput" type="text" placeholder="跳到帧号" style="width:96px;background:#3a3a3a;color:#eee;border:1px solid #555;border-radius:6px;padding:6px 8px;font-size:13px;">
+  <button id="jumpBtn">跳转</button>
+  <span id="prog" style="font-size:12px;color:#aaa;"></span>
+</div>
+<div class="hint">沿车道画<b>自由曲线</b>：在画面上<b>单击加点</b>，移动看预览，<b>双击或按回车结束当前线</b>，再单击开始画下一条。所有线同色（自动编号），<b>不分左/右、不强制直线、支持弯道</b>。
+建议画<b>你所在车道的中线（1 条自由曲线）</b>；也可画左右 2 条边线（训练时自动取中线）。菜单/加载帧无车道→直接 ← 跳过。
+<b>Z</b> 撤点 / <b>C</b> 清本图 / <b>←→</b> 翻图。</div>
+<div id="info"></div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<script>
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const info=document.getElementById('info'), prog=document.getElementById('prog');
+const LS_KEY='laneAnnPoly_v1';
+let images=[], idx=0, scale=1;
+let current=null;   // 正在画的线：归一化 [nx,ny] 点数组
+let cursor=null;     // 鼠标当前归一化位置（预览用）
+let annotations=loadLS();
+
+function loadLS(){ try{return JSON.parse(localStorage.getItem(LS_KEY))||{};}catch(e){return {};} }
+function saveLS(){ try{localStorage.setItem(LS_KEY,JSON.stringify(annotations));}catch(e){} }
+function ann(name){ if(!annotations[name]) annotations[name]=[]; return annotations[name]; }
+function ptCount(name){ return (annotations[name]||[]).reduce((s,l)=>s+l.length,0); }
+
+function loadFiles(list){
+  const arr=Array.from(list).filter(f=>f.type.startsWith('image/')); arr.sort((a,b)=>a.name.localeCompare(b.name));
+  if(!arr.length) return; let pend=arr.length;
+  arr.forEach(f=>{ const url=URL.createObjectURL(f); const im=new Image();
+    im.onload=()=>{ images.push({name:f.name,url,w:im.naturalWidth,h:im.naturalHeight,img:im}); if(--pend===0){ images.sort((a,b)=>a.name.localeCompare(b.name)); idx=0; render(); } };
+    im.src=url; });
+}
+document.getElementById('fileInput').onchange=e=>loadFiles(e.target.files);
+document.getElementById('dirInput').onchange =e=>loadFiles(e.target.files);
+
+function imgCoords(e){ const r=cv.getBoundingClientRect(); return [ (e.clientX-r.left)*(cv.width/r.width)/scale, (e.clientY-r.top)*(cv.height/r.height)/scale ]; }
+
+function drawPoly(pts,color,dash){
+  if(!pts||pts.length<1) return;
+  ctx.strokeStyle=color; ctx.lineWidth=3; if(dash) ctx.setLineDash([6,4]); else ctx.setLineDash([]);
+  ctx.beginPath();
+  pts.forEach((p,i)=>{ const X=p[0]*cv.width, Y=p[1]*cv.height; if(i===0)ctx.moveTo(X,Y); else ctx.lineTo(X,Y); });
+  ctx.stroke(); ctx.setLineDash([]);
+  if(pts.length>=2){ const m=pts[Math.floor(pts.length/2)]; ctx.fillStyle='#fff'; ctx.font='bold 13px sans-serif'; ctx.fillText(String(color==='#ffd400'?'+':dash?'':Math.round(m[0]*cv.width)), m[0]*cv.width+4, m[1]*cv.height-4); }
+}
+
+function render(){
+  if(!images.length){ info.textContent='未加载图片'; prog.textContent=''; return; }
+  const im=images[idx]; const maxW=Math.min(window.innerWidth*0.94,1500); scale=maxW/im.w;
+  const dw=Math.round(im.w*scale), dh=Math.round(im.h*scale); cv.width=dw; cv.height=dh;
+  ctx.drawImage(im.img,0,0,dw,dh);
+  const a=ann(im.name);
+  a.forEach((poly,i)=>drawPoly(poly,'#00e5ff',false));
+  if(current && current.length){ drawPoly(current,'#ffd400',false); if(cursor) drawPoly([current[current.length-1],cursor],'#ffd400',true); }
+  info.textContent=`图: ${im.name} ${im.w}x${im.h} | 线数 ${a.length} 点数 ${ptCount(im.name)}${current?` (画图中 +${current.length})`:''}`;
+  const done=images.filter(x=>((annotations[x.name]||[]).length>0)).length;
+  prog.textContent=`进度 ${idx+1}/${images.length}  已标注 ${done}/${images.length}`;
+}
+
+function resetTmp(){ current=null; cursor=null; }
+
+cv.addEventListener('click',e=>{ if(!images.length) return; const [px,py]=imgCoords(e); const im=images[idx]; const nx=px/im.w, ny=py/im.h; if(current===null) current=[[nx,ny]]; else current.push([nx,ny]); cursor=null; render(); });
+cv.addEventListener('dblclick',e=>{ e.preventDefault(); if(current && current.length>=2){ current.pop(); ann(images[idx].name).push(current); resetTmp(); saveLS(); render(); } });
+cv.addEventListener('pointermove',e=>{ if(current){ const im=images[idx]; const [px,py]=imgCoords(e); cursor=[px/im.w, py/im.h]; render(); } });
+
+function finishLine(){ if(current && current.length>=2){ ann(images[idx].name).push(current); resetTmp(); saveLS(); render(); } }
+function undoPt(){ if(current && current.length){ current.pop(); } else { const a=ann(images[idx].name); if(a.length) a.pop(); } saveLS(); render(); }
+function clearImg(){ annotations[images[idx].name]=[]; resetTmp(); saveLS(); render(); }
+function nav(d){ if(idx+d>=0 && idx+d<images.length){ idx+=d; resetTmp(); render(); } }
+
+document.getElementById('undoBtn').onclick=undoPt;
+document.getElementById('clearBtn').onclick=clearImg;
+document.getElementById('finishBtn').onclick=finishLine;
+document.getElementById('prevBtn').onclick=()=>nav(-1);
+document.getElementById('nextBtn').onclick=()=>nav(1);
+window.addEventListener('keydown',e=>{
+  if(!images.length) return;
+  if(e.key==='ArrowLeft'){ nav(-1); }
+  else if(e.key==='ArrowRight'){ nav(1); }
+  else if(e.key==='z'||e.key==='Z'){ undoPt(); }
+  else if(e.key==='c'||e.key==='C'){ clearImg(); }
+  else if(e.key==='Enter'){ finishLine(); }
+});
+
+function exportJSON(){
+  if(!images.length){ alert('先加载图片'); return; }
+  const out=images.map(im=>{ const a=annotations[im.name]||[]; return { image:im.name, width:im.w, height:im.h, polylines:a.map(p=>p.map(pt=>[+pt[0].toFixed(5),+pt[1].toFixed(5)])) }; });
+  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});
+  const el=document.createElement('a'); el.href=URL.createObjectURL(blob); el.download='lane_labels.json'; el.click();
+  info.textContent=`已导出 ${out.filter(o=>o.polylines.length).length} 张有标注 -> lane_labels.json`;
+}
+document.getElementById('exportBtn').onclick=exportJSON;
+
+document.getElementById('importInput').onchange=function(e){
+  const f=e.target.files[0]; if(!f) return; const r=new FileReader();
+  r.onload=()=>{ try{ const data=JSON.parse(r.result); let n=0;
+    if(Array.isArray(data)) data.forEach(d=>{ const name=d.image; if(!name||!Array.isArray(d.polylines)) return; const a=ann(name);
+      d.polylines.forEach(poly=>{ if(Array.isArray(poly)&&poly.length>=2){ a.push(poly.map(pt=>[+pt[0],+pt[1]])); n++; } }); });
+    saveLS(); render(); info.textContent='已导入合并 '+n+' 条线（仅追加，不覆盖已有）';
+  }catch(err){ alert('JSON 解析失败: '+err.message); } };
+  r.readAsText(f); e.target.value='';
+};
+
+document.getElementById('jumpBtn').onclick=function(){
+  const v=document.getElementById('jumpInput').value.trim(); if(!v||!images.length) return;
+  const i=images.findIndex(im=>im.name===v||im.name===v+'.jpg'||im.name.replace(/\.jpg$/i,'').startsWith(v));
+  if(i>=0){ idx=i; resetTmp(); render(); } else { info.textContent='未找到帧: '+v; }
+};
+document.getElementById('jumpInput').addEventListener('keydown',e=>{ if(e.key==='Enter') document.getElementById('jumpBtn').click(); });
+</script>
+</body>
+</html>

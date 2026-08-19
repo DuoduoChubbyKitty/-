@@ -1,0 +1,65 @@
+__pycache__/
+*.pyc
+data/
+models/
+checkpoints/
+*.bin
+*.h5
+*.pth
+*.pt
+.DS_Store
+留档/
+archive/
+cpp/build/
+*.so
+__pycache__/
+
+# Tauri / Rust 构建产物
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# Python venv
+.venv-app/
+.venv/
+
+# PyInstaller 打包产物
+packaging/dist/
+packaging/build/
+
+# 前端构建产物
+frontend/node_modules/
+frontend/dist/
+
+# 地图压缩包
+data/*.zst
+
+# IDE
+.vscode/
+.idea/
+
+# ── 开源发布排除项（不进公开仓库）──
+# 编译产物 / 二进制（非源码，任何开源仓库均不提交）
+.build/
+AuroraDriveUI*
+AuroraDrive.app/
+*.app/
+NeversetApp/
+AuroraRecorder.app/
+AuroraRecorder_副本.app/
+# 备份 / 临时副本（非源码）
+*.bak
+*.bak*
+*_副本/
+# 个人录制（游戏实况视频，体积大且非源码；见 NOTICE）
+recordings/
+# 旧版本软件目录 / 外来软件与版权地图数据（非本项目源码，禁止进公开仓库）
+上一版软件的/
+归档/
+*.crx
+.trae/backups/
+# Python 虚拟环境（依赖缓存，非源码；依赖见 requirements）
+.venv*/
+# models/ 与 data/ 含游戏发行商版权世界地图与超大权重/录制，依版权与体积排除（见 NOTICE）
+
+
+上一版软件的/  # NFD form (APFS) for 上一版软件的

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AuroraDrive · UI 克隆 + 自动化抽屉</title>
+<style>
+  :root{
+    --bg:#000; --cyan:#00E5FF; --orangeRed:#FF5C38; --danger:#FF3D47;
+    --txt2:rgba(255,255,255,.62); --txt3:rgba(255,255,255,.38);
+    --line:rgba(0,229,255,.28);
+  }
+  *{box-sizing:border-box; margin:0; padding:0; font-family:-apple-system,"SF Pro Display","PingFang SC",system-ui,sans-serif;}
+  html,body{height:100%; background:var(--bg); color:#fff; overflow:hidden;}
+  .stage{position:relative; width:100%; height:100%; padding-top:44px; display:flex;}
+
+  /* ---------- 左侧视口 ---------- */
+  .viewport{flex:1; position:relative; display:flex; align-items:center; justify-content:center; overflow:hidden;}
+  .viewport .wheel{
+    width:230px; height:230px; border-radius:50%;
+    border:1px solid rgba(0,229,255,.22);
+    box-shadow:inset 0 0 50px rgba(0,229,255,.05);
+    position:relative; display:flex; align-items:center; justify-content:center;
+  }
+  .viewport .wheel::before{content:""; position:absolute; width:60px; height:60px; border-radius:50%; border:1px solid rgba(0,229,255,.35);}
+  .viewport .wheel .dot{width:8px; height:8px; border-radius:50%; background:var(--cyan); box-shadow:0 0 12px var(--cyan);}
+  .viewport .horizon{position:absolute; top:34%; width:120%; height:1px; background:linear-gradient(90deg,transparent,rgba(0,229,255,.4),transparent); box-shadow:0 0 30px rgba(0,229,255,.25);}
+  .viewport .hud{position:absolute; left:22px; bottom:22px; font-size:13px; letter-spacing:1px; color:var(--txt2); display:flex; gap:18px;}
+  .viewport .hud b{color:var(--cyan); font-weight:600;}
+  .viewport .kbd{position:absolute; left:0; right:0; bottom:0; height:54px; display:flex; align-items:center; justify-content:center; gap:10px; background:linear-gradient(0deg,rgba(0,0,0,.7),transparent);}
+  .viewport .kbd span{display:inline-flex; align-items:center; justify-content:center; width:34px; height:34px; border-radius:8px; border:1px solid rgba(255,255,255,.18); font-size:13px; color:var(--txt2); background:rgba(255,255,255,.04);}
+
+  /* ---------- 右侧主侧边栏 ---------- */
+  .sidebar{width:360px; flex:0 0 360px; border-left:1px solid rgba(255,255,255,.07); padding:16px 14px; display:flex; flex-direction:column; gap:14px; overflow-y:auto; z-index:2; background:#000;}
+  .card{border-radius:16px; background:rgba(255,255,255,.045); border:1px solid transparent; background-clip:padding-box; position:relative;}
+  .card::before{content:""; position:absolute; inset:0; border-radius:16px; padding:1px; background:linear-gradient(135deg,rgba(0,229,255,.28),rgba(0,229,255,0)); -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude; pointer-events:none;}
+  .sec-h{display:flex; align-items:center; gap:8px; padding:14px 16px 6px; font-size:11px; letter-spacing:2.5px; color:var(--cyan); text-transform:uppercase; font-weight:600;}
+  .sec-h .bars{display:flex; gap:3px;}
+  .sec-h .bars i{width:3px; height:12px; background:var(--cyan); border-radius:1px; box-shadow:0 0 6px var(--cyan);}
+  .card .body{padding:4px 16px 16px;}
+  .chip{display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:20px; font-size:12px; border:1px solid rgba(255,255,255,.12); color:var(--txt2);}
+  .chip .led{width:7px; height:7px; border-radius:50%; background:var(--cyan); box-shadow:0 0 8px var(--cyan);}
+  .bar{height:8px; border-radius:5px; background:rgba(255,255,255,.08); overflow:hidden; margin:10px 0;}
+  .bar i{display:block; height:100%; width:72%; background:linear-gradient(90deg,var(--cyan),#7af9ff); box-shadow:0 0 10px var(--cyan);}
+  .big{font-size:40px; font-weight:700; color:#fff; letter-spacing:1px;}
+  .big small{font-size:14px; color:var(--txt3); font-weight:400; margin-left:4px;}
+  .row{display:flex; align-items:center; justify-content:space-between; margin-top:10px; font-size:13px; color:var(--txt2);}
+  .btn{width:100%; border:none; border-radius:12px; padding:12px; font-size:14px; font-weight:600; cursor:pointer; letter-spacing:1px;}
+  .btn.cyan{background:linear-gradient(180deg,#00E5FF,#00b8d4); color:#001016; box-shadow:0 0 20px rgba(0,229,255,.35);}
+  .btn.ghost{background:rgba(255,255,255,.05); color:var(--txt2); border:1px solid rgba(255,255,255,.12); box-shadow:none;}
+  .toggle{width:42px; height:24px; border-radius:14px; background:rgba(255,255,255,.12); position:relative; transition:.25s; flex:0 0 auto;}
+  .toggle.on{background:var(--cyan); box-shadow:0 0 12px var(--cyan);}
+  .toggle i{position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff; transition:.25s;}
+  .toggle.on i{left:21px;}
+  .slide{display:flex; align-items:center; gap:10px; margin-top:12px; font-size:12px; color:var(--txt3);}
+  .slide input{flex:1; accent-color:var(--cyan);}
+  .mini-row{display:flex; gap:8px; margin-top:12px;}
+  .mini-row .btn{flex:1; padding:9px; font-size:12px;}
+
+  /* AUTOMATION 触发卡 */
+  .auto-trigger{display:flex; align-items:center; justify-content:space-between; padding:14px 16px; cursor:pointer; transition:.2s;}
+  .auto-trigger:hover{background:rgba(0,229,255,.06);}
+  .auto-trigger .t{display:flex; align-items:center; gap:8px; font-size:13px; color:var(--cyan); font-weight:600; letter-spacing:1px;}
+  .auto-trigger .t .ico{font-size:16px;}
+  .auto-trigger .badge{font-size:11px; color:var(--txt3); border:1px solid rgba(255,255,255,.12); border-radius:10px; padding:2px 8px;}
+  .auto-trigger .chev{color:var(--cyan); transition:.3s;}
+  .auto-trigger.open .chev{transform:rotate(180deg);}
+
+  /* ---------- 自动化抽屉 ---------- */
+  .drawer{
+    width:0; flex:0 0 0; overflow:hidden;
+    border-left:1px solid transparent; background:#000;
+    transition:width .42s cubic-bezier(.34,1.56,.64,1), flex-basis .42s cubic-bezier(.34,1.56,.64,1), border-color .42s;
+    display:flex; flex-direction:column;
+  }
+  .drawer.open{width:300px; flex:0 0 300px; border-left:1px solid rgba(0,229,255,.2);}
+  .drawer .dhead{display:flex; align-items:center; justify-content:space-between; padding:18px 16px 8px;}
+  .drawer .dhead .ttl{font-size:11px; letter-spacing:2.5px; color:var(--cyan); font-weight:600; text-transform:uppercase;}
+  .drawer .close{cursor:pointer; font-size:18px; color:var(--txt2); line-height:1;}
+  .drawer .close:hover{color:var(--cyan);}
+  .drawer .list{padding:6px 12px 20px; display:flex; flex-direction:column; gap:9px; overflow-y:auto;}
+  .fn{
+    display:flex; align-items:center; gap:11px; padding:11px 12px; border-radius:13px;
+    background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07);
+    cursor:pointer; opacity:0; transform:translateX(26px);
+    transition:transform .4s cubic-bezier(.34,1.56,.64,1), opacity .35s, background .2s, border-color .2s;
+  }
+  .drawer.open .fn{opacity:1; transform:translateX(0);}
+  /* 竖排逐个弹跳延迟 */
+  .drawer.open .fn:nth-child(1){transition-delay:.06s;}
+  .drawer.open .fn:nth-child(2){transition-delay:.12s;}
+  .drawer.open .fn:nth-child(3){transition-delay:.18s;}
+  .drawer.open .fn:nth-child(4){transition-delay:.24s;}
+  .drawer.open .fn:nth-child(5){transition-delay:.30s;}
+  .drawer.open .fn:nth-child(6){transition-delay:.36s;}
+  .drawer.open .fn:nth-child(7){transition-delay:.42s;}
+  .drawer.open .fn:nth-child(8){transition-delay:.48s;}
+  .drawer.open .fn:nth-child(9){transition-delay:.54s;}
+  .fn:hover{background:rgba(0,229,255,.07); border-color:rgba(0,229,255,.35);}
+  .fn .emoji{font-size:18px; width:24px; text-align:center;}
+  .fn .nm{flex:1; font-size:13.5px; color:#fff; font-weight:500;}
+  .fn .fn-on{font-size:10px; color:var(--cyan); border:1px solid rgba(0,229,255,.4); border-radius:9px; padding:2px 7px; display:none;}
+  .fn.active{border-color:rgba(0,229,255,.5); background:rgba(0,229,255,.08);}
+  .fn.active .fn-on{display:inline-block;}
+  .fn .dotled{width:7px; height:7px; border-radius:50%; background:rgba(255,255,255,.2); flex:0 0 auto;}
+  .fn.active .dotled{background:var(--cyan); box-shadow:0 0 8px var(--cyan);}
+  .fn .tag{position:absolute;}
+  .fn .warn{margin-left:auto; font-size:9px; color:var(--danger); border:1px solid rgba(255,61,71,.4); border-radius:8px; padding:1px 6px;}
+  .fn{position:relative;}
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <!-- 左侧视口 -->
+  <div class="viewport">
+    <div class="horizon"></div>
+    <div class="wheel"><div class="dot"></div></div>
+    <div class="hud"><span>FRAMES <b>30</b></span><span>REC <b style="color:var(--orangeRed)">●</b></span></div>
+    <div class="kbd"><span>W</span><span>A</span><span>S</span><span>D</span><span>␣</span><span>⇧</span></div>
+  </div>
+
+  <!-- 右侧主侧边栏 -->
+  <div class="sidebar">
+    <div class="card">
+      <div class="sec-h"><span class="bars"><i></i><i></i><i></i></span>STATUS</div>
+      <div class="body">
+        <span class="chip"><span class="led"></span>端到端主驾 · E2E/M9</span>
+        <div class="bar"><i></i></div>
+        <div class="big">62<small>km/h</small></div>
+        <div class="row"><span>禁用控制</span><span style="color:var(--orangeRed)">OFF</span></div>
+        <div class="row"><span>FPS</span><b style="color:#fff">30</b></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sec-h"><span class="bars"><i></i><i></i><i></i></span>CONTROL</div>
+      <div class="body">
+        <span class="chip" style="border-color:rgba(0,229,255,.4);color:var(--cyan)">纯规则</span>
+        <button class="btn cyan" id="startBtn" style="margin-top:12px">▶ 开始驾驶</button>
+        <div class="row"><span>极速模式</span><div class="toggle" data-tg></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sec-h"><span class="bars"><i></i><i></i><i></i></span>CONFIG</div>
+      <div class="body">
+        <div class="slide">速度上限 <input type="range" min="0" max="100" value="80"><span>80</span></div>
+        <div class="slide">降级阈值 <input type="range" min="0" max="100" value="65"><span>65</span></div>
+        <div class="row"><span>行驶录制</span><div class="toggle" data-tg></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sec-h"><span class="bars"><i></i><i></i><i></i></span>TRAINING</div>
+      <div class="body">
+        <div class="row"><span>专家模式</span><div class="toggle" data-tg></div></div>
+        <div class="row"><span>字模识别</span><div class="toggle on" data-tg></div></div>
+        <div class="mini-row"><button class="btn ghost">● 录制</button><button class="btn ghost">⚙ 训练</button></div>
+        <div class="row" style="margin-top:10px"><span>模型版本</span><b style="color:#fff">m9_mono v2</b></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sec-h"><span class="bars"><i></i><i></i><i></i></span>MAP</div>
+      <div class="body"><button class="btn ghost">🗺 打开异环地图</button></div>
+    </div>
+
+    <!-- AUTOMATION 触发卡 -->
+    <div class="card auto-trigger" id="autoTrigger">
+      <div class="t"><span class="ico">🤖</span>自动化</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="badge">9 功能</span>
+        <span class="chev">›</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 自动化抽屉 -->
+  <div class="drawer" id="drawer">
+    <div class="dhead">
+      <span class="ttl">自动化 · MaaNTE</span>
+      <span class="close" id="drawerClose">✕</span>
+    </div>
+    <div class="list" id="fnList">
+      <div class="fn" data-fn><span class="emoji">🎣</span><span class="nm">自动钓鱼</span><span class="dotled"></span><span class="fn-on">运行中</span></div>
+      <div class="fn" data-fn><span class="emoji">🥤</span><span class="nm">自动做咖啡</span><span class="dotled"></span><span class="fn-on">运行中</span></div>
+      <div class="fn" data-fn><span class="emoji">🐾</span><span class="nm">粉爪大劫案</span><span class="dotled"></span><span class="fn-on">运行中</span><span class="warn">最凶</span></div>
+      <div class="fn" data-fn><span class="emoji">🪑</span><span class="nm">自动收家具</span><span class="dotled"></span><span class="fn-on">运行中</span></div>
+      <div class="fn" data-fn><span class="emoji">💎</span><span class="nm">自动领奖励</span><span class="dotled"></span><span class="fn-on">运行中</span></div>
+      <div class="fn" data-fn><span class="emoji">🎹</span><span class="nm">自动弹钢琴</span><span class="dotled"></span><span class="fn-on">运行中</span></div>
+      <div class="fn" data-fn><span class="emoji">🎵</span><span class="nm">自动超强音</span><span class="dotled"></span><span class="fn-on">运行中</span></div>
+      <div class="fn" data-fn><span class="emoji">⚔️</span><span class="nm">自动闪避</span><span class="dotled"></span><span class="fn-on">运行中</span></div>
+      <div class="fn" data-fn><span class="emoji">🕛</span><span class="nm">实时辅助</span><span class="dotled"></span><span class="fn-on">运行中</span></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  const trigger = document.getElementById('autoTrigger');
+  const drawer  = document.getElementById('drawer');
+  const close   = document.getElementById('drawerClose');
+
+  trigger.addEventListener('click', () => {
+    const open = drawer.classList.toggle('open');
+    trigger.classList.toggle('open', open);
+  });
+  close.addEventListener('click', () => {
+    drawer.classList.remove('open');
+    trigger.classList.remove('open');
+  });
+
+  // 功能按钮：点一下切换运行状态（仅 UI 模拟）
+  document.querySelectorAll('[data-fn]').forEach(el => {
+    el.addEventListener('click', () => el.classList.toggle('active'));
+  });
+  // 普通开关
+  document.querySelectorAll('[data-tg]').forEach(t => {
+    t.addEventListener('click', e => { e.stopPropagation(); t.classList.toggle('on'); });
+  });
+  // 启动驾驶按钮
+  const sb = document.getElementById('startBtn');
+  sb.addEventListener('click', () => {
+    const on = sb.textContent.includes('开始');
+    sb.textContent = on ? '■ 停止驾驶' : '▶ 开始驾驶';
+    sb.classList.toggle('cyan', on);
+    sb.classList.toggle('ghost', !on);
+  });
+</script>
+</body>
+</html>
