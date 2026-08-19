@@ -20,8 +20,9 @@ Third-party components and their licenses
 1. MetalGoose — MetalFX upscaling / frame-generation engine
    Upstream : https://github.com/Stallion77RepoOfficial/MetalGoose
    License  : GNU GPL v3.0  (see Vendor/MetalGoose/LICENSE)
-   Status   : Vendored UNMODIFIED under Vendor/MetalGoose/ (its original
-              LICENSE and README are included verbatim).
+   Status   : Vendored under Vendor/MetalGoose/ with TWO documented, minimal
+              extensions (see Vendor/MetalGoose/NOTICE.md); its original LICENSE
+              and README are included verbatim. It is NOT byte-for-byte upstream.
    Use      : Built as a separate SwiftPM target `MetalGooseEngine` and used
               ONLY on the display path (UpscaleFrameHostView) to upscale and
               interpolate the on-screen preview. It is NEVER used on the
@@ -53,3 +54,11 @@ under GNU GPL v3.0. Each file carries an SPDX header:
 
 Modifications to vendored MetalGoose files, if any, are noted in
 Vendor/MetalGoose/NOTICE.md.
+
+   Extensions (documented, not behavioral patches):
+     - Vendor/MetalGoose/Engine/GooseUpscaler.swift  (NEW, AuroraDrive-owned,
+       GPL-3.0): a public façade re-exposing make/attachToView/detachFromView/
+       ingest without altering GooseEngine's internal API.
+     - GooseEngine.swift: one public `ingest(cgImage:timestamp:)` method + a
+       `setupPipelines` change that compiles Shaders.metal from source at runtime
+       (SwiftPM does not auto-build .metal into a default.metallib).

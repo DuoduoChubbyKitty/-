@@ -9,7 +9,8 @@ let package = Package(
         // MGFG-1 插帧需要 macOS 26+ 的 MetalFX；本 target 以 Swift 6 模式编译。
         .target(
             name: "MetalGooseEngine",
-            path: "Vendor/MetalGoose/Engine"
+            path: "Vendor/MetalGoose/Engine",
+            resources: [.copy("Shaders.metal")]
         ),
         .executableTarget(
             name: "AuroraDrive",

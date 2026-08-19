@@ -18,6 +18,7 @@ import Darwin   // mach_task_basic_info：诊断进程内存占用（验证"积�
 import CoreVideo  // CVPixelBuffer：YOLO 直通帧跳帧缓冲
 import Metal
 import MetalKit
+import MetalGooseEngine
 
 // 应用启动时强制激活窗口到前台（直接 swift 运行时窗口默认不激活）
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1690,7 +1691,7 @@ struct FrameHostView: NSViewRepresentable {
 /// 仅用于「给人看的显示叠加层」；捕获→推理→注入决策链完全不经过这里。
 final class UpscaleFrameHost {
     private weak var mtkView: MTKView?
-    private var engine: GooseEngine?
+    private var engine: GooseUpscaler?
 
     func attach(_ view: MTKView) {
         // 重新挂载前先释放旧引擎，避免重复 MTKViewDelegate
@@ -1705,7 +1706,7 @@ final class UpscaleFrameHost {
         view.enableSetNeedsDisplay = false
         view.isPaused = false
 
-        if let engine = GooseEngine.make() {
+        if let engine = GooseUpscaler.make() {
             self.engine = engine
             engine.attachToView(view, displayRefreshRate: 60, minRefreshRate: 30)
         }

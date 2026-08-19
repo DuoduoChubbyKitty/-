@@ -447,7 +447,19 @@ final class GooseEngine: NSObject, MTKViewDelegate, @unchecked Sendable {
     }
     
     private func setupPipelines() {
-        guard let library = device.makeDefaultLibrary() else {
+        // AuroraDrive integration: SwiftPM does not auto-compile .metal into a
+        // default.metallib, so compile Shaders.metal from source at runtime via
+        // Bundle.module (the file is declared as a copied resource). Falls back
+        // to makeDefaultLibrary() when a prebuilt metallib happens to be present.
+        let library: MTLLibrary? = {
+            if let url = Bundle.module.url(forResource: "Shaders", withExtension: "metal"),
+               let src = try? String(contentsOf: url, encoding: .utf8),
+               let compiled = try? device.makeLibrary(source: src, options: nil) {
+                return compiled
+            }
+            return device.makeDefaultLibrary()
+        }()
+        guard let library else {
             reportError("Error Code: MG-ENG-001 Metal pipeline setup failed.")
             return
         }
