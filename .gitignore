@@ -61,5 +61,8 @@ recordings/
 .venv*/
 # models/ 与 data/ 含游戏发行商版权世界地图与超大权重/录制，依版权与体积排除（见 NOTICE）
 
-
 上一版软件的/  # NFD form (APFS) for 上一版软件的
+
+# AI 助手工作区（含 token、会话历史，不应公开）
+.workbuddy/
+Trae对话记录/
