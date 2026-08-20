@@ -52,8 +52,9 @@ final class InferenceEngine {
     // MARK: - 模型参数（与训练导出一致）
 
     /// 输入图像尺寸 H×W（模型训练时的分辨率）
-    static let inputHeight = 180
-    static let inputWidth = 320
+    /// nonisolated：warmUp 的 Sendable 后台闭包要读，且是编译期常量、无 actor 依赖
+    nonisolated static let inputHeight = 180
+    nonisolated static let inputWidth = 320
 
     /// vehicle_state 维度（nonisolated：编译期常量，无 actor 依赖）
     private nonisolated static let stateDim = 6

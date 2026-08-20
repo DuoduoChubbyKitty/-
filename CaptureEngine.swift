@@ -56,11 +56,19 @@ final class CaptureEngine: NSObject, SCStreamOutput {
     /// 绕开 NSImage 缩放链路；与 onFrame / onYoloFrame 互不影响
     var onNativeFrame: ((CVPixelBuffer) -> Void)?
 
+    /// 插帧引擎原生全帧直通回调（每帧调用，传入**整幅**原生分辨率 CVPixelBuffer，未缩放）
+    /// MetalGoose 插帧（独立显示引擎）专用：与 onFrame(480px 显示帧)/onYoloFrame/onNativeFrame(ROI)
+    /// 完全独立，自动驾驶决策链路不吃它。在 captureQueue 内同步整帧拷贝后送出。
+    var onUpscaleFrame: ((CVPixelBuffer) -> Void)?
+
     /// 速度表 ROI（归一化，左上角原点 y 向下）。字模录制（glyphMode）与 SpeedOCR 共用此 ROI。
     /// 环1：copyNativeFrame 只拷贝该区域（≈100KB，替代整帧 22MB），
     /// SpeedOCRReader 用同一常量把槽位坐标换算到 ROI 相对坐标（与 Python crop_slot(roi=...) 一致）。
-    nonisolated static let speedROINorm = CGRect(x: 0.455, y: 0.885,
-                                                 width: 0.080, height: 0.050)
+    /// 默认覆盖右下角 "N 000 km/h" 速度表；用户「标注HUD」手动框选覆盖，预设记忆。
+    /// 写侧（主线程标注确认，低频）/读侧（copyNativeFrame，captureQueue 每帧）——
+    /// nonisolated(unsafe)：CGRect 4×Double 的 torn 风险在低频写/高频读下可忽略。
+    nonisolated(unsafe) static var speedROINorm = CGRect(x: 0.50, y: 0.76,
+                                                         width: 0.32, height: 0.18)
 
     /// 状态变化回调（启动/停止/错误）
     var onStatusChange: ((CaptureStatus) -> Void)?
@@ -96,6 +104,43 @@ final class CaptureEngine: NSObject, SCStreamOutput {
     private var nativePool: CVPixelBufferPool?
     private var nativePoolWidth = 0
     private var nativePoolHeight = 0
+
+    /// 插帧引擎全帧缓冲池（整幅原生分辨率自持拷贝，深度 ≥4）
+    private var fullFramePool: CVPixelBufferPool?
+    private var fullFramePoolWidth = 0
+    private var fullFramePoolHeight = 0
+
+    /// 插帧直通开关（线程安全）：关闭时不整帧拷贝/不回调，零开销。
+    /// DriveState 在主线程开关变化时写入，captureQueue 每帧读取。
+    private let upscaleGateLock = OSAllocatedUnfairLock()
+    private var _upscaleEnabled = false
+    var upscaleEnabled: Bool {
+        get { upscaleGateLock.withLock { _upscaleEnabled } }
+        set { upscaleGateLock.withLock { _upscaleEnabled = newValue } }
+    }
+
+    /// 游戏模式兼容开关（线程安全）：开启时每帧对捕获线程设置
+    /// THREAD_TIME_CONSTRAINT_POLICY 时间约束调度，对抗 macOS 游戏模式
+    /// 对后台 App 的降权（游戏全屏时后台线程被饿，capWork 5ms→数秒、App 只有一帧）。
+    /// 关闭恢复普通调度（游戏模式降权重新生效）。DriveState 主线程开关变化时写入，
+    /// captureQueue 每帧读取。
+    private let gameModeBoostLock = OSAllocatedUnfairLock()
+    private var _gameModeBoostEnabled = true
+    var gameModeBoostEnabled: Bool {
+        get { gameModeBoostLock.withLock { _gameModeBoostEnabled } }
+        set { gameModeBoostLock.withLock { _gameModeBoostEnabled = newValue } }
+    }
+
+    /// YOLO 直通缩放闸门（线程安全）：关闭时跳过 全屏→640 vImage 缩放 + onYoloFrame 回调。
+    /// 待机（未驾驶）时 YOLO 检测既不被决策用也不被叠加层显示（ObstacleOverlay active=isDriving），
+    /// 若录制（仅采集画面）仍每帧做 2940×1920→640 的 CPU vImage 缩放纯属浪费 ——
+    /// DriveState 在开始驾驶时置 true、停止驾驶时置 false，captureQueue 每帧读取。
+    private let yoloGateLock = OSAllocatedUnfairLock()
+    private var _yoloScalingEnabled = false
+    var yoloScalingEnabled: Bool {
+        get { yoloGateLock.withLock { _yoloScalingEnabled } }
+        set { yoloGateLock.withLock { _yoloScalingEnabled = newValue } }
+    }
 
     /// YOLO 直通缩放缓冲池（vImage 直接缩放进池化私有缓冲，每帧独立，池深度 ≥4）
     /// 缓冲由下游 onYoloFrame 闭包强捕获持有，直到 tick 消费 + inferFast 拷贝完才释放回池；
@@ -242,6 +287,9 @@ final class CaptureEngine: NSObject, SCStreamOutput {
                 self.nativePool = nil
                 self.nativePoolWidth = 0
                 self.nativePoolHeight = 0
+                self.fullFramePool = nil
+                self.fullFramePoolWidth = 0
+                self.fullFramePoolHeight = 0
                 self.yoloBufferPool = nil
                 self.yoloBufferPoolSize = 0
                 self.uiBufferPool = nil
@@ -259,6 +307,10 @@ final class CaptureEngine: NSObject, SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         // 只处理屏幕画面帧（忽略音频）
         guard type == .screen else { return }
+
+        // 游戏模式兼容：每帧对当前线程设置时间约束调度（幂等，<1µs），
+        // 对抗游戏模式对后台 App 的降权；开关关闭时跳过（零开销）。
+        if gameModeBoostEnabled { applyGameModeBoost() }
 
         // P1 修复：SCStream delegate 回调不自动包 autoreleasepool，30fps 下每帧
         // 临时对象（NSImage/CGImage/CGDataProvider/vImage 等）若不在帧末释放，
@@ -279,6 +331,13 @@ final class CaptureEngine: NSObject, SCStreamOutput {
         defer { lastFrameWorkMs = Date().timeIntervalSince(frameStart) * 1000 }
         updateFPS()
 
+        // ── 插帧引擎原生全帧直通：整幅原生分辨率自持拷贝 ──
+        // 独立显示引擎（MetalGoose），决策链路不吃；先于 ROI 拷贝送出，
+        // 保证插帧拿到的是未缩放的完整游戏画面。开关关闭时跳过，零开销。
+        if upscaleEnabled, let onUpscaleFrame, let fullCopy = copyFullFrame(from: pixelBuffer) {
+            onUpscaleFrame(fullCopy)
+        }
+
         // ── 原生帧直通：在 captureQueue 内同步拷贝到自持缓冲，再派发主线程 ──
         // SCStream 的 CVPixelBuffer 由系统缓冲池管理，主线程稍慢时可能被系统
         // 回收/覆写 → use-after-release（轻则裁出垃圾、重则崩溃）。
@@ -290,8 +349,10 @@ final class CaptureEngine: NSObject, SCStreamOutput {
         }
 
         // ── YOLO 直通：CPU vImage 缩放到模型输入尺寸（YoloEngine.inputSize，640）──
-        // 在源头完成缩放，绕开大图 → NSImage → CGImage → 再缩放的链路
-        if let onYoloFrame {
+        // 在源头完成缩放，绕开大图 → NSImage → CGImage → 再缩放的链路。
+        // 闸门 yoloScalingEnabled：未驾驶时（录制采集画面/待机预览）YOLO 检测无用，
+        // 跳过 2940×1920→640 的整帧 vImage 缩放，避免白烧 CPU。
+        if yoloScalingEnabled, let onYoloFrame {
             // 直接缩放进池化私有缓冲（每帧独立、池深度 ≥4），下游 onYoloFrame 强捕获该缓冲，
             // 直到 tick 消费 + inferFast 拷贝完才释放回池 —— 主线程卡顿也不会拿到被覆写的帧。
             // 相比旧「双缓冲 + copyYoloFrame 整拷一份」省掉一次 640×640×4 ≈ 1.6MB 冗余 memcpy。
@@ -536,6 +597,62 @@ final class CaptureEngine: NSObject, SCStreamOutput {
         return pool
     }
 
+    /// 同步拷贝**整幅**原生帧到自持缓冲（仅 captureQueue 串行调用）
+    /// 供插帧引擎（MetalGoose 独立显示链路）使用：保持原生分辨率喂入，
+    /// 行序照抄 src bytesPerRow（row 0 = 画面顶部，不翻转、不解释方向）。
+    /// - Returns: 整帧自持拷贝缓冲；拷贝失败返回 nil（调用方跳过该帧直通）
+    private func copyFullFrame(from src: CVPixelBuffer) -> CVPixelBuffer? {
+        let w = CVPixelBufferGetWidth(src)
+        let h = CVPixelBufferGetHeight(src)
+        guard w > 0, h > 0,
+              let pool = fullFrameBufferPool(width: w, height: h) else { return nil }
+
+        var dst: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &dst)
+        guard status == kCVReturnSuccess, let dst else { return nil }
+
+        CVPixelBufferLockBaseAddress(src, .readOnly)
+        CVPixelBufferLockBaseAddress(dst, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(src, .readOnly)
+            CVPixelBufferUnlockBaseAddress(dst, [])
+        }
+        guard let sBase = CVPixelBufferGetBaseAddress(src),
+              let dBase = CVPixelBufferGetBaseAddress(dst) else { return nil }
+
+        let sBPR = CVPixelBufferGetBytesPerRow(src)
+        let dBPR = CVPixelBufferGetBytesPerRow(dst)
+        let rowBytes = min(sBPR, dBPR)          // 每行拷贝字节数（行尾对齐填充不拷）
+        for r in 0..<h {
+            memcpy(dBase + r * dBPR, sBase + r * sBPR, rowBytes)
+        }
+        return dst
+    }
+
+    /// 惰性创建（或复用）整幅原生分辨率缓冲池（深度 ≥4）
+    private func fullFrameBufferPool(width: Int, height: Int) -> CVPixelBufferPool? {
+        if let pool = fullFramePool, fullFramePoolWidth == width, fullFramePoolHeight == height {
+            return pool
+        }
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+        ]
+        var pool: CVPixelBufferPool?
+        let status = CVPixelBufferPoolCreate(
+            kCFAllocatorDefault,
+            [kCVPixelBufferPoolMinimumBufferCountKey: 4] as CFDictionary,
+            attrs as CFDictionary, &pool)
+        guard status == kCVReturnSuccess, let pool else { return nil }
+        fullFramePool = pool
+        fullFramePoolWidth = width
+        fullFramePoolHeight = height
+        return pool
+    }
+
     /// FPS 统计（每秒计算一次）
     private func updateFPS() {
         fpsAccumulator += 1
@@ -545,6 +662,48 @@ final class CaptureEngine: NSObject, SCStreamOutput {
             captureFPS = Double(fpsAccumulator) / elapsed
             fpsAccumulator = 0
             lastFPSDate = now
+        }
+    }
+
+    // MARK: - 游戏模式对抗（时间约束调度）
+
+    /// 给当前线程设置时间约束调度（THREAD_TIME_CONSTRAINT_POLICY）。
+    /// 系统保证该线程在每个 period 周期内至少拿到 computation 的 CPU 时间，
+    /// 调度优先级高于游戏模式等"后台任务降权"——专业录屏/音频线程对抗
+    /// macOS 游戏模式的标准做法（苹果官方：游戏模式"降低后台任务资源占用"）。
+    ///
+    /// 参数保守（30fps 决策链红线不动）：
+    /// - period      = 33.3ms  （30fps 帧周期）
+    /// - computation = 10ms    （每帧预算；正常 capWork≈5ms，留 2 倍余量）
+    /// - constraint  = 20ms    （单帧硬上限，超限由系统仲裁，不会失控占核）
+    /// 每帧只占用单核 ~30% 的保证份额，游戏仍拿大头；空闲（无帧）时线程阻塞不占片。
+    ///
+    /// GCD 捕获队列可能复用线程池线程，故每帧对"当前线程"幂等设置（一次 mach 调用，
+    /// <1µs，不触碰 30fps 红线）；线程回池后带策略继续服务本 App 其他队列无碍
+    /// （都是自家活，且空闲线程不占时间片）。
+    private func applyGameModeBoost() {
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        func units(_ ns: UInt32) -> UInt32 {
+            guard tb.denom > 0, tb.numer > 0 else { return ns }
+            return UInt32((UInt64(ns) * UInt64(tb.denom)) / UInt64(tb.numer))
+        }
+        var pol = thread_time_constraint_policy_data_t(
+            period: units(33_333_333),      // 33.3ms 周期（30fps）
+            computation: units(18_000_000), // 每帧预算 18ms（实测 capWork 游戏模式下需 ~15-20ms）
+            constraint: units(30_000_000),  // 单帧硬上限 30ms
+            preemptible: 1)                 // 可被更高优先级抢占（安全）
+        // Mach 参数：flavor 用 UInt32；policy 指针须 rebind 到 integer_t (Int32)；
+        // count = 策略结构体按 integer_t 计的元素数（thread_time_constraint = 4）。
+        let count = mach_msg_type_number_t(MemoryLayout<thread_time_constraint_policy_data_t>.size
+                                           / MemoryLayout<integer_t>.size)
+        withUnsafeMutablePointer(to: &pol) { p in
+            p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { ip in
+                thread_policy_set(mach_thread_self(),
+                                  UInt32(THREAD_TIME_CONSTRAINT_POLICY),
+                                  ip,
+                                  count)
+            }
         }
     }
 }

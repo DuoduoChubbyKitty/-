@@ -94,6 +94,8 @@ struct AutomationCard: View {
 struct AutomationDrawer: View {
     @Binding var open: Bool
     @State private var running = Set<UUID>()
+    /// 入场动画开关：抽屉由 ContentView 条件性插入视图树，onAppear 置位触发内部阶梯弹入
+    @State private var appeared = false
 
     private let functions = AutomationLibrary.functions
 
@@ -130,9 +132,9 @@ struct AutomationDrawer: View {
             .padding(.horizontal, 14)
             .padding(.top, 16)
             .padding(.bottom, 10)
-            .opacity(open ? 1 : 0)
-            .offset(x: open ? 0 : 30)
-            .animation(.spring(response: 0.42, dampingFraction: 0.72).delay(open ? 0.02 : 0), value: open)
+            .opacity(appeared ? 1 : 0)
+            .offset(x: appeared ? 0 : 30)
+            .animation(.spring(response: 0.42, dampingFraction: 0.72).delay(0.02), value: appeared)
 
             // 功能列表
             ScrollView(.vertical, showsIndicators: false) {
@@ -140,7 +142,7 @@ struct AutomationDrawer: View {
                     ForEach(Array(functions.enumerated()), id: \.element.id) { idx, item in
                         AutomationFnButton(item: item,
                                            index: idx,
-                                           open: open,
+                                           appeared: appeared,
                                            active: running.contains(item.id)) {
                             withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
                                 if running.contains(item.id) {
@@ -156,7 +158,7 @@ struct AutomationDrawer: View {
                 .padding(.bottom, 20)
             }
         }
-        .frame(width: open ? 300 : 0, alignment: .trailing)
+        .frame(width: 300, alignment: .trailing)
         .clipped()
         .background(
             ZStack {
@@ -171,7 +173,12 @@ struct AutomationDrawer: View {
                                      startPoint: .top, endPoint: .bottom))
                 .frame(width: 1)
         }
-        .animation(.spring(response: 0.5, dampingFraction: 0.62, blendDuration: 0), value: open)
+        // 抽屉由 ContentView 条件性插入/移除；入场后再置位 appeared 触发内部阶梯弹入
+        .onAppear {
+            withAnimation(.spring(response: 0.5, dampingFraction: 0.62, blendDuration: 0)) {
+                appeared = true
+            }
+        }
     }
 }
 
@@ -180,7 +187,7 @@ struct AutomationDrawer: View {
 private struct AutomationFnButton: View {
     let item: AutomationFunctionItem
     let index: Int
-    let open: Bool
+    let appeared: Bool
     let active: Bool
     let toggle: () -> Void
 
@@ -241,9 +248,9 @@ private struct AutomationFnButton: View {
         .onHover { h in
             withAnimation(.easeOut(duration: 0.18)) { hovered = h }
         }
-        .offset(x: open ? 0 : 46)
-        .opacity(open ? 1 : 0)
+        .offset(x: appeared ? 0 : 46)
+        .opacity(appeared ? 1 : 0)
         .animation(.spring(response: 0.46, dampingFraction: 0.72, blendDuration: 0)
-            .delay(open ? Double(index) * 0.055 : 0), value: open)
+            .delay(appeared ? Double(index) * 0.055 : 0), value: appeared)
     }
 }

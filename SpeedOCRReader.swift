@@ -49,6 +49,7 @@ import CoreVideo
 import Foundation
 import ImageIO
 import Observation
+import UniformTypeIdentifiers
 
 /// 固定槽位模板匹配车速读取引擎
 /// - @Observable：UI 可观察 speedKmh / confidence
@@ -59,21 +60,20 @@ import Observation
 @MainActor
 final class SpeedOCRReader {
 
-    // MARK: - 槽位常量（与 tools/build_speed_glyphs.py 同步；改这里必须同步改那边）
+    // MARK: - 槽位常量（运行时可由「标注HUD」预设动态设置；json 同步值仅作初始默认）
 
     /// 3 个数字槽的归一化 x 中心（左上角原点，x 向右）
     /// - 2026-08-15 由 clip_20260815_130055 实测校准：ROI 内 digit centers ≈ [71,120,169]px
-    nonisolated static let slotCentersNorm: [CGFloat] = [0.479, 0.496, 0.512]
+    /// - 2026-08-20：改为运行时可变——用户「标注HUD」框选后由 DriveState.applyHUDROI 按
+    ///   ROI 内右侧三等分推导并覆盖；读侧（ocrQueue）/写侧（主线程标注）低频竞争可忽略。
+    nonisolated(unsafe) static var slotCentersNorm: [CGFloat] = [0.600, 0.660, 0.720]
 
-    /// 每个槽的归一化宽度（覆盖数字 + 抖动余量）
-    /// - 实测最大数字宽度 ≈ 41px / 2940px = 0.014；旧 0.022 导致相邻槽重叠 17~21px
-    nonisolated static let slotWidthNorm: CGFloat = 0.014
+    /// 每个槽的归一化宽度（覆盖数字 + 抖动余量；数字物理宽度不随 ROI 变，保持默认）
+    nonisolated(unsafe) static var slotWidthNorm: CGFloat = 0.020
 
     /// 数字本体的归一化 y 上下界（左上角原点，y 向下）
-    /// - 注意：y_min 必须跳过仪表台顶部反光带，否则 Otsu 把整张判定为前景
-    nonisolated static let slotYMinNorm: CGFloat = 0.897
-    /// - y_max 由实测数字底部 0.9319 取 0.932，避免旧 0.924 切掉下半段笔画
-    nonisolated static let slotYMaxNorm: CGFloat = 0.932
+    nonisolated(unsafe) static var slotYMinNorm: CGFloat = 0.800
+    nonisolated(unsafe) static var slotYMaxNorm: CGFloat = 0.880
 
     /// 模板缩放尺寸（H × W）；与字模库 JSON 里 template_height/template_width 一致
     nonisolated static let templateHeight: Int = 45
@@ -159,6 +159,15 @@ final class SpeedOCRReader {
 
     // MARK: - 内部状态
 
+    /// 原生帧跨队列只读传递包装（@unchecked Sendable）。
+    /// onNativeFrame 送来的 CVPixelBuffer 是 CaptureEngine 私有池的整拷贝：
+    /// 闭包强持有 → 池不会复用覆写，且 ocrQueue 串行内只读（cropSlots/saveOCRDebug
+    /// 均为读操作）→ 生命周期与写竞争均由工程约定保证，手动声明 Sendable。
+    private final class NativeFrameBox: @unchecked Sendable {
+        let buffer: CVPixelBuffer
+        init(_ buffer: CVPixelBuffer) { self.buffer = buffer }
+    }
+
     @ObservationIgnored
     private let ocrQueue = DispatchQueue(label: "com.aurora.speedocr",
                                          qos: .userInitiated)
@@ -170,6 +179,12 @@ final class SpeedOCRReader {
     /// 5Hz 时间闸：上一次成功入队推理的时间
     @ObservationIgnored
     private var lastInferTime: Date?
+
+    /// 死诊断节流：fg 过低（画面无速度表）时 30Hz 每帧触发写盘会打爆磁盘
+    /// （每帧写 4 个 PNG）。限制为最快每 1 秒写一次，覆盖写，仍能定位根因。
+    /// 只在 ocrQueue 后台线程读写，无跨线程竞争 → nonisolated(unsafe)（同 YoloEngine.pixelBuffer）。
+    @ObservationIgnored
+    nonisolated(unsafe) private var lastDebugWriteTime: Date?
 
     /// 上一帧有效车速（用于跳变过滤）
     @ObservationIgnored
@@ -204,12 +219,8 @@ final class SpeedOCRReader {
         // 模板尺寸校验（防御性）
         guard lib.templateHeight == Self.templateHeight,
               lib.templateWidth == Self.templateWidth else { return }
-        // 槽位常量校验：Python 改了常量而 Swift 没改 → 拒绝加载，防静默错位
-        // （归一化坐标差 0.001 = 全屏 2940px 下约 3px，足够让匹配系统性失准）
-        guard lib.slotCentersNorm == Self.slotCentersNorm.map({ Double($0) }),
-              lib.slotWidthNorm == Double(Self.slotWidthNorm),
-              lib.slotYMinNorm == Double(Self.slotYMinNorm),
-              lib.slotYMaxNorm == Double(Self.slotYMaxNorm) else { return }
+        // 槽位常量不再与 json 硬校验：2026-08-20 起槽位由「标注HUD」预设运行时动态设置
+        // （UserDefaults aurora.hudROI），json 里的 slot_* 字段仅作初始默认，不参与校验。
         var out: [String: [UInt8]] = [:]
         for (k, rows) in lib.templates {
             // rows: [[Int]] 展平成 [UInt8]，长度应为 H*W
@@ -259,14 +270,23 @@ final class SpeedOCRReader {
         let gen = generation
         let glyphsSnapshot = loadedGlyphs
         let roiNorm = CaptureEngine.speedROINorm
+        let frame = NativeFrameBox(nativePixelBuffer)   // Sendable 包装，跨队列只读传递
         isInferencing = true
         ocrQueue.async { [weak self] in
+            guard let self else { return }
             // 1. CIImage 路径裁 3 个槽位（pure crop，无插值无放大）
             //    环1 后输入是 ROI 切片，槽位坐标按 speedROINorm 换算到 ROI 相对坐标
-            guard let slotImages = Self.cropSlots(from: nativePixelBuffer,
+            guard let slotImages = Self.cropSlots(from: frame.buffer,
                                                   roiNorm: roiNorm) else {
+                // 诊断：槽位裁剪失败（ROI 与槽位坐标不匹配）→ 存 ROI 快照供精调
+                let now = Date()
+                if self.lastDebugWriteTime == nil
+                    || now.timeIntervalSince(self.lastDebugWriteTime!) >= 1.0 {
+                    self.lastDebugWriteTime = now
+                    Self.saveOCRDebug(buffer: frame.buffer, slots: [], fg: 0)
+                }
                 Task { @MainActor in
-                    self?.finish(gen, RecognitionResult(diag: "槽位裁剪失败"))
+                    self.finish(gen, RecognitionResult(diag: "槽位裁剪失败"))
                 }
                 return
             }
@@ -274,16 +294,20 @@ final class SpeedOCRReader {
             // 2. 后台跑模板匹配（闭包捕获不可变 CGImage，关闭跨线程共享缓冲竞态）
             let result = Self.recognize(slotImages: slotImages,
                                         glyphs: glyphsSnapshot)
-            // 死诊断：fg 过低（画面无速度表 / 裁到空）→ 把 App 实际截到的全屏缩略图
-            // + 三槽裁图存盘到 /tmp/aurora_ocr_dbg_*.png，供部署后一锤定音定位
-            // （截错显示器？坐标/朝向错位？分辨率被压？）。覆盖写，不阻塞主线程。
-            if result.speed == nil,
-               let diag = result.diag, diag.hasPrefix("fg=") {
-                Self.saveOCRDebug(buffer: nativePixelBuffer,
-                                  slots: slotImages, fg: result.fgTotal)
+            // 死诊断：识别失败（任何原因）→ 把 App 实际截到的 ROI 快照 + 三槽裁图存盘到
+            // /tmp/aurora_ocr_dbg_*.png，供部署后一锤定音定位（截错位置？坐标/朝向错位？
+            // 分辨率被压？）。覆盖写，不阻塞主线程。节流 1s/次，避免打爆磁盘。
+            if result.speed == nil {
+                let now = Date()
+                if self.lastDebugWriteTime == nil
+                    || now.timeIntervalSince(self.lastDebugWriteTime!) >= 1.0 {
+                    self.lastDebugWriteTime = now
+                    Self.saveOCRDebug(buffer: frame.buffer,
+                                      slots: slotImages, fg: result.fgTotal)
+                }
             }
             Task { @MainActor in
-                self?.finish(gen, result)
+                self.finish(gen, result)
             }
         }
     }
@@ -757,7 +781,8 @@ final class SpeedOCRReader {
     nonisolated private static func writePNG(_ cg: CGImage, to path: String) {
         let url = URL(fileURLWithPath: path)
         guard let dest = CGImageDestinationCreateWithURL(url as CFURL,
-                                                         kUTTypePNG, 1, nil) else { return }
+                                                         UTType.png.identifier as CFString,
+                                                         1, nil) else { return }
         CGImageDestinationAddImage(dest, cg, nil)
         CGImageDestinationFinalize(dest)
     }

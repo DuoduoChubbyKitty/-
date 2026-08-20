@@ -233,6 +233,13 @@ struct GameMapView: View {
     // ── 关闭动画 ──
     @State private var isClosing: Bool = false
 
+    // ── 标记分层缓存（P 性能）──
+    // 缓存「按类型优先级排好序的候选池」，键 = 启用类型集合 + 搜索词。
+    // 平移/缩放时 body 每帧重算 filteredMarkers，但 filter+sort 5677 个标记是
+    // O(n log n) 大头；缓存后每帧只做 O(cap) 的均匀抽样，拖动不再卡。
+    @State private var sortedPoolCache: [MapMarker] = []
+    @State private var sortedPoolKey: String = ""
+
     // ── 侧边栏 tab（筛选模式下：分类 / 索引）──
     @State private var sidebarTab: SidebarTab = .categories
 
@@ -589,19 +596,82 @@ struct GameMapView: View {
 
     /// 根据图层开关状态返回要渲染的标记（图层浮层 / 筛选侧栏共享同一份 categories 状态）
     /// ⚠️ 标记坐标目前与底图可能未配准（旧数据），待本机重抓 nteguide 最新数据后校准。
+    ///
+    /// 分层渲染（P 性能）：全库 5677 个标记，若全部作为 SwiftUI 视图塞进 ZStack，
+    /// 平移/缩放时每帧重建 5677 个 view 直接卡死。这里按缩放层级裁剪数量：
+    ///   正常模式：只渲染核心导航层（waypoint/tower/region/phone-booth ≈ 130 个）—— 恒定量，不裁。
+    ///   筛选模式：按 zoom 分层 200 / 500 / 1500 上限（与项目规范「200/500/1500 标记按缩放层级」一致）。
+    /// 裁剪采用「类型优先级 + 均匀抽样」：核心类型（传送点/塔/地名/BOSS）始终保留，
+    /// 超出上限的收集类（材料/宝箱/谕石…）按步长均匀抽取，保证空间分布不聚簇。
     private func filteredMarkers(db: MapDatabase) -> [MapMarker] {
         let enabledTypes = Set(categories.filter { $0.isEnabled }.map { $0.id })
         guard !enabledTypes.isEmpty else { return [] }
-        let all = db.markers_all ?? []
-        var result = all.filter { enabledTypes.contains($0.type ?? "") }
-        // 搜索过滤（与侧边栏索引一致）
-        if !searchText.isEmpty {
-            result = result.filter {
-                ($0.name ?? "").localizedCaseInsensitiveContains(searchText) ||
-                ($0.nameEn ?? "").localizedCaseInsensitiveContains(searchText)
+
+        // ── 分层上限：正常模式不裁（恒 ~130 核心标记）；筛选模式按缩放裁剪。──
+        let cap: Int
+        if mode == .normal {
+            cap = Int.max
+        } else if scale < 0.25 {
+            cap = 200
+        } else if scale < 0.6 {
+            cap = 500
+        } else {
+            cap = 1500
+        }
+
+        // ── 排序候选池缓存：filter+sort 只依赖 categories+searchText（不依赖 scale/offset）──
+        // 键变化才重建；平移/缩放 body 重算时直接复用，每帧只做 O(cap) 抽样。
+        let key = enabledTypes.sorted().joined(separator: ",") + "|" + searchText
+        if key != sortedPoolKey {
+            let all = db.markers_all ?? []
+            var result = all.filter { enabledTypes.contains($0.type ?? "") }
+            if !searchText.isEmpty {
+                result = result.filter {
+                    ($0.name ?? "").localizedCaseInsensitiveContains(searchText) ||
+                    ($0.nameEn ?? "").localizedCaseInsensitiveContains(searchText)
+                }
+            }
+            // 稳定排序（同优先级内保持原序）
+            let sorted = result.enumerated()
+                .sorted { a, b in
+                    let pa = Self.markerPriority(a.element.type ?? "")
+                    let pb = Self.markerPriority(b.element.type ?? "")
+                    if pa != pb { return pa < pb }
+                    return a.offset < b.offset
+                }
+            sortedPoolCache = sorted.map(\.element)
+            sortedPoolKey = key
+        }
+        let pool = sortedPoolCache
+
+        // ── 数量足够 → 直接返回（正常模式恒返回全量核心标记）──
+        guard pool.count > cap else { return pool }
+
+        // ── 分层裁剪：核心类型始终保留，其余均匀抽样保证空间不聚簇 ──
+        let keptCore = pool.filter { Self.markerPriority($0.type ?? "") == 0 }
+        let others = pool.filter { Self.markerPriority($0.type ?? "") > 0 }
+        var out = keptCore
+        let room = max(0, cap - out.count)
+        if room > 0, !others.isEmpty {
+            let step = Double(others.count) / Double(room)
+            var idx = 0.0
+            while idx < Double(others.count), out.count < cap {
+                out.append(others[Int(idx)])
+                idx += step
             }
         }
-        return result
+        return out
+    }
+
+    /// 标记类型渲染优先级（数字越小越靠前保留）：
+    ///   core 导航层（waypoint/tower/region/phone-booth/BOSS）恒显示；
+    ///   其余收集类按缩放裁剪。
+    private static func markerPriority(_ type: String) -> Int {
+        switch type {
+        case "waypoint", "tower", "region", "phone-booth", "boss": return 0
+        case "quest", "activity", "viewpoint", "service", "shop": return 1
+        default: return 2   // 材料/宝箱/谕石/收集品/神秘箱/货币…
+        }
     }
 
     /// 单个标记视图
@@ -1680,14 +1750,26 @@ struct GameMapView: View {
     // MARK: - 数据加载
 
     private func loadData() {
-        // 巨图（8636×8592 PNG）解码移到后台，主线程零解码阻塞，只回写加载态
+        // 巨图（11264² PNG）解码移到后台，主线程零解码阻塞，只回写加载态
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            // 1. 后台解码底图（优先 enhanced_1366.png，缺失时回退到旧游戏地图）
+            // 1. 后台解码底图（优先 bigworldmapSecond.png，缺失时回退到旧游戏地图）
             var decoded: NSImage?
             if FileManager.default.fileExists(atPath: mapImagePath) {
                 decoded = NSImage(contentsOfFile: mapImagePath)
             } else if FileManager.default.fileExists(atPath: altMapImagePath) {
                 decoded = NSImage(contentsOfFile: altMapImagePath)
+            }
+
+            // 1b. 标记数据库（7.5MB JSON）也挪到后台解码 —— 主线程只接收解码结果，
+            // 避免地图首次打开时 JSONDecoder 阻塞 UI 几十毫秒（可感知掉帧）。
+            var decodedDb: MapDatabase?
+            if FileManager.default.fileExists(atPath: dataPath) {
+                do {
+                    let raw = try Data(contentsOf: URL(fileURLWithPath: dataPath))
+                    decodedDb = try JSONDecoder().decode(MapDatabase.self, from: raw)
+                } catch {
+                    print("⚠️ 地图数据库加载失败: \(error)")
+                }
             }
 
             DispatchQueue.main.async {
@@ -1698,15 +1780,10 @@ struct GameMapView: View {
                     mapAspect = img.size.width / max(img.size.height, 1)
                 }
 
-                // 3. 加载标记数据库（JSON 较小，保留主线程）
-                if FileManager.default.fileExists(atPath: dataPath) {
-                    do {
-                        let raw = try Data(contentsOf: URL(fileURLWithPath: dataPath))
-                        db = try JSONDecoder().decode(MapDatabase.self, from: raw)
-                        buildCategories()
-                    } catch {
-                        print("⚠️ 地图数据库加载失败: \(error)")
-                    }
+                // 3. 主线程回写数据库 + 构建分类
+                if let dbData = decodedDb {
+                    db = dbData
+                    buildCategories()
                 }
 
                 // 4. 默认选中新赫兰德
