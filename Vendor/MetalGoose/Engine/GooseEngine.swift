@@ -905,7 +905,11 @@ final class GooseEngine: NSObject, MTKViewDelegate, @unchecked Sendable {
         mtkView = nil
     }
 
+    /// TEMP DIAGNOSIS: MG_DEBUG=1 enables render-loop debug prints.
+    private static let _isDebugDiagnosticsEnabled = ProcessInfo.processInfo.environment["MG_DEBUG"] == "1"
+
     nonisolated func draw(in view: MTKView) {
+        if Self._isDebugDiagnosticsEnabled { print("[MG-DIAG] draw(in:) called") }
         MainActor.assumeIsolated {
             renderFrame(in: view)
         }
@@ -915,6 +919,8 @@ final class GooseEngine: NSObject, MTKViewDelegate, @unchecked Sendable {
     private var renderFrameCount: Int = 0
     private var renderFPSStartTime: CFTimeInterval = 0
     private var interpolatedFrameCount: Int = 0
+    // TEMP DIAG: phase-selection tally for the interpolation branch
+    private var diagPhase0 = 0, diagPhase1 = 0, diagPhaseHalf = 0, diagInterpNil = 0, diagSceneCut = 0, diagDumpCount = 0
     /// Cache misses in the generator over the current measurement window — the
     /// count of images actually synthesised, as opposed to presents that showed
     /// one.
@@ -964,7 +970,12 @@ final class GooseEngine: NSObject, MTKViewDelegate, @unchecked Sendable {
         guard view.window != nil,
               drawableSize.width > 0, drawableSize.height > 0,
               let renderPipeline = renderPipeline,
-              let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            if Self._isDebugDiagnosticsEnabled {
+                print("[MG-DIAG] guard fail win=\(view.window != nil) dsz=\(drawableSize) pipe=\(renderPipeline != nil) cq=\(commandQueue != nil)")
+            }
+            return
+        }
 
         let config = self.config
         let currentTime = CACurrentMediaTime()
@@ -1097,21 +1108,27 @@ final class GooseEngine: NSObject, MTKViewDelegate, @unchecked Sendable {
                 outputTex = prev.texture
                 sourceTimestamp = prev.timestamp
                 contentKey = prev.timestamp
+                diagPhase0 += 1
+                if Self._isDebugDiagnosticsEnabled, diagDumpCount < 6 { diagDumpCount += 1; print("[MG-DIAG] sample t=\(String(format:"%.3f",t)) phase=\(phase) dur=\(String(format:"%.1f",duration*1000))ms target=\(String(format:"%.0f",targetTime*1000)) prev=\(String(format:"%.0f",prev.timestamp*1000)) next=\(String(format:"%.0f",next.timestamp*1000)) delay=\(String(format:"%.1f",interpolationDelay(outputInterval:nominalInterval, mode: config.frameGenMode)*1000))ms") }
             } else if phase == 1 {
                 outputTex = next.texture
                 sourceTimestamp = next.timestamp
                 contentKey = next.timestamp
+                diagPhase1 += 1
+                if Self._isDebugDiagnosticsEnabled, diagDumpCount < 6 { diagDumpCount += 1; print("[MG-DIAG] sample t=\(String(format:"%.3f",t)) phase=\(phase) dur=\(String(format:"%.1f",duration*1000))ms target=\(String(format:"%.0f",targetTime*1000)) prev=\(String(format:"%.0f",prev.timestamp*1000)) next=\(String(format:"%.0f",next.timestamp*1000)) delay=\(String(format:"%.1f",interpolationDelay(outputInterval:nominalInterval, mode: config.frameGenMode)*1000))ms") }
             } else if next.isSceneCut {
                 outputTex = next.texture
                 sourceTimestamp = next.timestamp
                 contentKey = next.timestamp
                 frameInterpolatorNeedsHistoryReset = true
+                diagSceneCut += 1
             } else if let interpolated = interpolateFrame(prev: prev, next: next,
                                                           mode: config.frameGenMode,
                                                           commandBuffer: commandBuffer) {
                 outputTex = interpolated.texture
                 isInterpolated = true
                 generatedNewImage = interpolated.isNew
+                diagPhaseHalf += 1
                 // The generated frame stands for targetTime, not for prev — using
                 // prev here overstated latency by up to a whole capture interval.
                 // Interpolation had to wait for `next` before it could produce
@@ -1125,6 +1142,7 @@ final class GooseEngine: NSObject, MTKViewDelegate, @unchecked Sendable {
                 outputTex = t < 0.5 ? prev.texture : next.texture
                 sourceTimestamp = t < 0.5 ? prev.timestamp : next.timestamp
                 contentKey = sourceTimestamp ?? -1
+                diagInterpNil += 1
             }
         } else {
             outputTex = frameBuffer.newestFrame?.texture
@@ -1162,6 +1180,10 @@ final class GooseEngine: NSObject, MTKViewDelegate, @unchecked Sendable {
         // the figure by roughly the refresh ratio.
         if generatedNewImage { generatedFrameCount += 1 }
         if elapsed >= 1.0 {
+            if Self._isDebugDiagnosticsEnabled {
+                print("[MG-DIAG] phase0=\(diagPhase0) phase1=\(diagPhase1) phaseHalf=\(diagPhaseHalf) interpNil=\(diagInterpNil) sceneCut=\(diagSceneCut)")
+                diagPhase0 = 0; diagPhase1 = 0; diagPhaseHalf = 0; diagInterpNil = 0; diagSceneCut = 0
+            }
             statsLock.lock()
             _stats.outputFPS = Float(renderFrameCount) / Float(elapsed)
             _stats.generatedFPS = Float(generatedFrameCount) / Float(elapsed)
@@ -1432,6 +1454,12 @@ final class GooseEngine: NSObject, MTKViewDelegate, @unchecked Sendable {
             reportError("Error Code: MG-ENG-EXT-002 IOSurface missing")
             return
         }
+        // 喂帧间隔喂给捕获速率估计器：interpolationDelay = max(output, capture)，
+        // 目标时间必须落在两帧之间的括号中部才会取 phase=0.5 产出中间帧。
+        // 若这里不更新估计器，估计区间恒为 0 → delay=输出间隔 → targetTime 永远贴在
+        // 最新帧之后 → phase 恒判 1（纯透传，插帧不产帧）。这正是 APP 经 ingest 喂帧
+        // 时插帧失效的根因（ScreenCaptureKit 路径已单独调 updateCaptureStats）。
+        updateCaptureStats(currentTime: CACurrentMediaTime(), captureTimestamp: timestamp)
         processSurface(surf, pixelBuffer: buf, timestamp: timestamp, isSceneCut: false)
     }
 

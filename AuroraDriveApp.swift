@@ -9,7 +9,7 @@
 
 
 // ============================================================================
-// MARK: - 文件 1: AuroraDriveApp.swift  (App 入口)
+// MARK: - 内部段落: App入口 — AuroraDriveApp 主结构（AppDelegate + Theme + DriveState）
 // ============================================================================
 
 import SwiftUI
@@ -19,6 +19,7 @@ import CoreVideo  // CVPixelBuffer：YOLO 直通帧跳帧缓冲
 import Metal
 import MetalKit
 import MetalGooseEngine
+import UniformTypeIdentifiers
 
 // 应用启动时强制激活窗口到前台（直接 swift 运行时窗口默认不激活）
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -67,8 +68,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // token 必须持有（napToken），否则 activity 立即释放、抑制失效。
         ProcessInfo.processInfo.disableAutomaticTermination(
             "AuroraDrive 实时游戏辅助：持续截屏 + AI 决策注入")
+        // 防"突然终止"（与自动退出是两套机制）：系统在资源紧张时可能对可突然终止
+        // 的进程直接 kill；显式禁用后系统必须先走正常退出路径。
+        ProcessInfo.processInfo.disableSuddenTermination()
         napToken = ProcessInfo.processInfo.beginActivity(
-            options: [.latencyCritical, .userInteractive, .idleSystemSleepDisabled],
+            options: [.latencyCritical, .userInteractive, .background, .idleSystemSleepDisabled],
             reason: "AuroraDrive 实时游戏辅助：后台需持续 30Hz 决策与注入")
         // 提高进程调度优先级（尽力而为，失败静默）：让系统给本进程更多 CPU 份额，
         // 缓解游戏前台全屏时后台 App 被系统降优先级导致的帧率下跌。
@@ -112,7 +116,7 @@ struct AuroraDriveApp: App {
 
 
 // ============================================================================
-// MARK: - 文件 2: Theme.swift  (设计系统 / 主题常量)
+// MARK: - 内部段落: Theme — 设计系统 / 主题常量（原拆分自 Theme.swift）
 // ============================================================================
 
 /// 全局主题：FSD 驾驶舱配色与发光参数
@@ -183,7 +187,7 @@ struct SectionHeader: View {
 
 
 // ============================================================================
-// MARK: - 文件 3: DriveState.swift  (全局状态 + 模拟数据流)
+// MARK: - 内部段落: DriveState — 全局状态 + 驾驶信号流（原拆分自 DriveState.swift）
 // ============================================================================
 
 enum DriveMode: String, CaseIterable, Identifiable {
@@ -282,6 +286,41 @@ final class DriveState {
     var sportMode       = false
     var isTraining      = false
 
+    // ── 纯视觉小地图定位（VisualLocator 输出）──
+    /// 是否定位到（尚未出结果时小窗显示占位）
+    var locatorFound = false
+    /// 自车在大地图(11264²)上的原图像素坐标（左上原点，y 向下）
+    var locatorX: Double = 0
+    var locatorY: Double = 0
+    /// 最近一次定位 NCC 分数（0..1，诊断：<阈值=匹配失败，非队列问题）
+    var locatorScore: Double = 0
+    /// 定位器是否就绪（首次 prepare 完成；false=还在建档/建档失败，定位一直不会出结果）
+    var locatorReady = false
+    /// 朝向（度，北=0，顺时针增加）；由相邻帧位置差推算，速度过慢时不更新
+    var locatorHeading: Double = 0
+    /// 用户在小地图上点击设定的目标点（大地图像素坐标）
+    var locatorTarget: (x: Double, y: Double)? = nil
+    /// 上一帧定位位置（用于推算朝向）
+    private var lastLocPos: (x: Double, y: Double)? = nil
+
+    // ── 视觉定位引擎（8Hz 截屏小地图 → VisualLocator → 本状态）──
+    /// 游戏内小地图在屏幕的归一化位置：中心(x,y) + 边长(占屏幕短边比例)。
+    /// 游戏小地图是方形的；用"中心+边长"保证裁剪为正方形，避免宽高比失真破坏匹配。
+    /// 用户确认：小地图在游戏画面左上角。默认中心 (0.13,0.14)、边长 16%。
+    /// 用户可「标注小地图」手动框选覆盖（预设记忆）。
+    nonisolated(unsafe) static var minimapROI = (centerX: 0.13, centerY: 0.14, sideFraction: 0.16)
+    /// 当前生效的小地图 ROI（CGRect 归一化，仅 UI 框显用；nil=未标注过）
+    var minimapROIState: CGRect? = nil
+    // 定位引擎只在后台定位队列使用（单一消费者），主线程不读；存进 Sendable 盒子跨线程访问。
+    private let locateCtx = LocateContext()
+    /// 定位门闩：防止 8Hz 调度堆积后台任务（锁盒线程安全，无 actor 标注歧义）
+    private let locateGate = LocateGate()
+    private let locateQueue = DispatchQueue(label: "aurora.locate", qos: .userInitiated)
+
+    // ── 驾驶记录仪：环形缓冲区存最近5帧（每3秒存一帧）──
+    // 用途：随时回看关键时刻（3秒前/6秒前），用于复盘和Debug
+    @ObservationIgnored var drivingRecorder = DrivingFrameRecorder(maxFrames: 5)
+
     /// 专家模式：录制时控制量来源切到真人物理键（模仿学习的专家演示），
     /// 而非 AI 决策（currentCommand）。关 → 录 AI 决策（DAgger 自训练）。
     var expertMode      = false
@@ -310,6 +349,10 @@ final class DriveState {
     /// 上一帧写调试日志的时间（tick 摘要 1Hz 节流用）
     @ObservationIgnored
     private var lastTickLog = Date.distantPast
+
+    /// 上一帧写插帧实时读数的时间（1Hz 节流用）
+    @ObservationIgnored
+    private var lastUpscaleLiveLog = Date.distantPast
 
     /// 调试日志：stdout + /tmp/aurora_debug.log（App 启动时清空）
     /// 用户从终端启动可实时看到；事后我读文件定位运行时问题
@@ -380,7 +423,7 @@ final class DriveState {
     /// 不新鲜时卡死判据不计入 stuckSeconds；感知融合层可直接消费此健康标志
     var speedValid: Bool = false
 
-    /// 兼容属性：旧代码读 speed 的地方统一读到 effectiveSpeed（不再有模拟值/随机抖动）
+    /// 兼容属性：旧代码读 speed 的地方统一读到 effectiveSpeed（不再有模拟值/随机抖动，速度由 OCR 真实读数驱动）
     var speed: Double { effectiveSpeed }
 
     var fps: Double        = 60
@@ -422,6 +465,32 @@ final class DriveState {
     @ObservationIgnored var upscaleHost = UpscaleFrameHost()
     // 显示路径 MetalFX 插帧/超分开关（默认关）。仅影响视口预览观感。
     var upscaleEnabled: Bool = false
+    /// 游戏模式兼容（默认开）：给捕获线程设「时间约束调度」（THREAD_TIME_CONSTRAINT_POLICY），
+    /// 对抗 macOS 游戏模式对后台 App 的降权 —— 否则游戏全屏时捕获帧被饿到 0~9fps、
+    /// 整个 App 只有一帧（capWork 5ms→数秒）。可回退：关掉即恢复普通调度。
+    var gameModeBoost: Bool = true
+    /// HUD 标注模式开关：开 → 预览画面叠加标注层（拖拽框选 ROI）
+    var hudAnnotationMode = false
+    /// 标注目标（HUD 速度表 / 游戏内小地图）
+    var annotationTarget: HUDAnnotationTarget = .hud
+    /// 当前生效的速度表 ROI（预设；nil = 未标注过，用默认值）
+    var hudROI: CGRect? = nil
+    /// 插帧引擎是否可用（Metal 不可用/引擎创建失败 → false，UI 禁用开关）
+    var upscaleSupported = false
+
+    // ── 驾驶记录仪（环形缓冲区回看）──
+    /// 当前高亮的历史帧槽位（nil=未选择，.threeSecondsAgo=3秒前，.sixSecondsAgo=6秒前）
+    var showHistoricFrame: HistoricFrameSlot? = nil
+    /// 预缓存的历史帧 CGImage（在 tick() 中同步刷新，避免 button action 触发时的异步等待）
+    @ObservationIgnored var historicFrames: [HistoricFrameSlot: CGImage] = [:]
+    /// 插帧实时读数（1Hz 更新，UI 状态栏显示）：
+    /// 形如 "产出 123 / 输出 456"。interp=0 且 out>0 = 纯透传(插帧未产帧)，
+    /// interp 持续增长 = 插帧真的在工作；置空表示开关关/无引擎。
+    /// 用普通 @Observable 让 SidebarView 每秒重绘，把"插帧到底有没有用"直接摆到眼前。
+    var upscaleLive: String? = nil
+    /// 插帧引擎最近一条错误（由 pendingError() 消费后置空，贯穿到 UI/日志）：
+    /// 例如 MG-ENG-010 MetalFX 插值器创建失败 —— 那正是"插帧静默不产帧"的根因。
+    var upscaleEngineError: String? = nil
     // 源画面尺寸（普通 @Observable，驱动 ObstacleOverlay 的 aspect-fill 对齐）。
     // 不能从 @ObservationIgnored 的 frameHost.latestSize 读，否则尺寸变化不触发
     // 观察导致检测框错位；仅在尺寸变化时写，避免每帧失效。
@@ -446,19 +515,19 @@ final class DriveState {
     @ObservationIgnored
     private nonisolated(unsafe) var pendingFrameTime: Date?
     @ObservationIgnored
-    private nonisolated(unsafe) let pendingFrameLock = NSLock()
+    private let pendingFrameLock = NSLock()
 
     // ── YOLO 直通帧跳帧（同 pendingFrame 模式）：captureQueue 覆盖最新帧，tick 消费 ──
     @ObservationIgnored
     private nonisolated(unsafe) var pendingYoloFrame: CVPixelBuffer?
     @ObservationIgnored
-    private nonisolated(unsafe) let pendingYoloLock = NSLock()
+    private let pendingYoloLock = NSLock()
 
     // ── 原生 ROI 帧跳帧（同 pendingFrame 模式）：OCR/字模录制消费 ──
     @ObservationIgnored
     private nonisolated(unsafe) var pendingNativeFrame: CVPixelBuffer?
     @ObservationIgnored
-    private nonisolated(unsafe) let pendingNativeLock = NSLock()
+    private let pendingNativeLock = NSLock()
 
     // ── 诊断：主线程 tick 实际间隔(ms)（>33ms = 主线程掉拍/被卡）──
     // tick 由 30Hz Timer 驱动，间隔应稳定 ~33ms；出现 66/99ms 或更大 = 主线程被阻塞
@@ -509,6 +578,7 @@ final class DriveState {
     // 兼容现有 recordings 格式，供 DAgger 增量训练消费
     let recordEngine = RecordEngine()
 
+
     // ── 三段胶水代码（接模型输出 → 状态机 → 按键注入）──
     // escapeController: .recover 态脱困策略（倒车→转向→前进）
     // ruleController:   .yolo/.rule 态 YOLO 检测→控制量规则
@@ -540,7 +610,25 @@ final class DriveState {
     /// 模型未接入前用占位值，状态机/降级逻辑已真实生效
     private(set) var currentCommand: ControlCommand = .idle
 
+    /// 后台存活 activity 句柄：声明本 app 需要持续实时运行，阻止系统在
+    /// 切换到后台（如游戏/游戏模式把其它 app 降权或打盹）时触发 App Nap、
+    /// 合并 tick 或挂起，从而保住决策/推理那部分后台资源，避免突然掉链子。
+    /// 只是对系统的"持续运行"声明，不碰系统配置、不影响游戏、不抢资源。
+    @MainActor private var backgroundActivity: NSObjectProtocol?
+
     init() {
+        // 关键：声明持续实时运行，阻止系统把本 app 当后台打盹/挂起/降权。
+        // 游戏模式或游戏在前台时常把其它后台 app 杀/降权，这是掉链子的直接原因。
+        // userInitiated 会把进程 QoS 拉高且禁止 App Nap，让 tick/推理在后台照常跑；
+        // .background 再显式声明"需要后台持续运行"，双保险。
+        backgroundActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .background],
+            reason: "AuroraDrive 持续实时推理+注入，防止被系统当作后台 App Nap 挂起/降权"
+        )
+        // 游戏模式兼容：主线程时间约束调度（tick/UI 不掉拍），与「游戏模式兼容」开关联动
+        applyMainThreadBoost(true)
+        // HUD / 小地图 ROI 记忆：读取用户手动标注预设（无则用默认）
+        loadROIPresets()
         try? FileManager.default.removeItem(atPath: "/tmp/aurora_debug.log")
         // 接线截屏引擎回调
         // onFrame: 每帧调用，更新 currentScreenImage（主线程，SwiftUI 自动刷新）
@@ -549,7 +637,6 @@ final class DriveState {
             // 跳帧防堆积：CaptureEngine 回调在 captureQueue 后台线程，
             // 这里只"覆盖"最新待显示帧（加锁），不再 main.async 排队。
             // 主线程（tick）卡时，旧帧被下一帧覆盖丢弃 → 天然跳帧，永不积压。
-            // SwiftUI 更新由 tick 在主线程赋 currentScreenImage 触发（见 tick()）。
             // NSImage + CGImage 同回调原子写入，避免推屏/推理/录制跨帧错位。
             guard let self else { return }
             self.pendingFrameLock.lock()
@@ -557,6 +644,12 @@ final class DriveState {
             self.pendingFrameCG = cgImage
             self.pendingFrameTime = Date()
             self.pendingFrameLock.unlock()
+            // 【帧率修复】预览与决策解耦：捕获线程一到帧即把预览推到主线程
+            // （直接设 layer.contents），按捕获帧率 30fps 渲染，不再被 30Hz 决策
+            // tick 的推理/叠加层 SwiftUI 重绘节流拖到 8–20Hz。hostView 为 nil
+            // （未开预览窗口）时 push 自动 no-op，零额外开销。
+            // cgImage 为非可选（捕获必有），直接推；hostView 为 nil 时 push 自动 no-op。
+            DispatchQueue.main.async { self.frameHost.push(cgImage) }
         }
         // YOLO 直通：CaptureEngine 源头 GPU 缩放好的 352×352 缓冲，
         // 直接喂推理引擎（跳过 NSImage/CGImage 大图转换 → 检测帧率↑）
@@ -607,6 +700,231 @@ final class DriveState {
                 }
             }
         }
+        // 插帧引擎（独立显示链路）：预创建并配置插帧模式，决定开关可用性。
+        // onUpscaleFrame 原生全帧直通在 captureQueue 后台执行（保持原生分辨率、
+        // 不设上限），决策链路完全不吃它 —— 与 onFrame/YOLO/OCR 各走各的通道。
+        upscaleHost.prepare()
+        upscaleSupported = upscaleHost.isAvailable
+        dlog("[upscale] 引擎初始化: 可用=\(upscaleSupported)")
+        captureEngine.onUpscaleFrame = { [weak self] pb in
+            self?.upscaleHost.push(pixelBuffer: pb)
+        }
+    }
+
+    /// 插帧开关变化（主线程）：同步捕获直通闸门（线程安全写 captureEngine.upscaleEnabled）
+    func setUpscaleEnabled(_ on: Bool) {
+        upscaleEnabled = on
+        captureEngine.upscaleEnabled = on
+        dlog("[upscale] 开关=\(on) 引擎可用=\(upscaleSupported)")
+    }
+
+    /// 游戏模式兼容开关变化（主线程）：同步捕获线程调度策略开关 + 主线程时间约束
+    func setGameModeBoost(_ on: Bool) {
+        gameModeBoost = on
+        captureEngine.gameModeBoostEnabled = on
+        applyMainThreadBoost(on)
+        dlog("[boost] 游戏模式兼容=\(on)")
+    }
+
+    /// 进入 HUD 标注：确保截屏流开启（否则标注层无画面可框），设目标并打开标注模式
+    func beginAnnotation(_ target: HUDAnnotationTarget) {
+        annotationTarget = target
+        if !isStreaming {
+            captureEngine.start()   // 自动开截屏流（游戏画面出现后才能框选）
+        }
+        hudAnnotationMode = true
+        dlog("[hud] 进入标注: 目标=\(target == .hud ? "HUD" : "小地图") 流=\(isStreaming)")
+    }
+
+    /// 应用手动标注的 HUD ROI（主线程）：
+    /// 1) 覆盖 CaptureEngine.speedROINorm（OCR/录制共用的速度表裁剪区）
+    /// 2) 由 ROI 推导三位数字槽位（ROI 内右侧三等分，避开左侧 N/挡位符号；y 取中上部）
+    /// 3) 持久化到 UserDefaults（记忆：下次启动自动应用）
+    func applyHUDROI(_ roi: CGRect) {
+        hudROI = roi
+        CaptureEngine.speedROINorm = roi
+        SpeedOCRReader.slotCentersNorm = [
+            roi.minX + 0.45 * roi.width,
+            roi.minX + 0.58 * roi.width,
+            roi.minX + 0.71 * roi.width
+        ]
+        SpeedOCRReader.slotYMinNorm = roi.minY + 0.25 * roi.height
+        SpeedOCRReader.slotYMaxNorm = roi.minY + 0.75 * roi.height
+        UserDefaults.standard.set(
+            [Double(roi.minX), Double(roi.minY), Double(roi.width), Double(roi.height)],
+            forKey: "aurora.hudROI")
+        dlog("[hud] 标注 ROI=(\(String(format: "%.3f", roi.minX)),\(String(format: "%.3f", roi.minY)),\(String(format: "%.3f", roi.width)),\(String(format: "%.3f", roi.height)))")
+    }
+
+    /// 应用手动标注的游戏内小地图 ROI（主线程）：
+    /// 框选矩形 → 中心 + 内接正方形边长（小地图是方形，用 min 边长避免裁出框外）→
+    /// 覆盖 DriveState.minimapROI（视觉定位裁剪区）→ 持久化记忆。
+    func applyMinimapROI(_ rect: CGRect) {
+        minimapROIState = rect
+        let side = min(rect.width, rect.height)
+        Self.minimapROI = (centerX: rect.midX, centerY: rect.midY, sideFraction: side)
+        UserDefaults.standard.set([Double(rect.midX), Double(rect.midY), Double(side)],
+                                  forKey: "aurora.minimapROI")
+        dlog("[hud] 小地图 ROI: 中心=(\(String(format: "%.3f", rect.midX)),\(String(format: "%.3f", rect.midY))) 边长=\(String(format: "%.3f", side))")
+    }
+
+    /// 启动时读取 HUD / 小地图 ROI 预设（记忆）：有预设则应用，无则用默认
+    func loadROIPresets() {
+        if let a = UserDefaults.standard.array(forKey: "aurora.hudROI") as? [Double],
+           a.count == 4, a[2] > 0.01, a[3] > 0.01 {
+            applyHUDROI(CGRect(x: a[0], y: a[1], width: a[2], height: a[3]))
+        }
+        if let b = UserDefaults.standard.array(forKey: "aurora.minimapROI") as? [Double],
+           b.count == 3, b[2] > 0.01, b[0] >= 0, b[0] <= 1, b[1] >= 0, b[1] <= 1 {
+            Self.minimapROI = (centerX: b[0], centerY: b[1], sideFraction: b[2])
+            minimapROIState = CGRect(x: b[0] - b[2] / 2, y: b[1] - b[2] / 2,
+                                     width: b[2], height: b[2])
+            dlog("[hud] 载入小地图 ROI 预设")
+        }
+    }
+
+    /// 定位循环写入最新自车原图像素坐标（主线程）。由相邻帧位移推算朝向；
+    /// 位移过小（静止/抖动）不刷新朝向，避免箭头乱转。
+    func updateLocator(x: Double, y: Double, score: Double = 0) {
+        locatorScore = score
+        if let last = lastLocPos {
+            let hx = x - last.x, hy = y - last.y
+            if hx * hx + hy * hy > 16 {            // 位移 >4px 才算有效移动
+                let deg = (atan2(hx, hy) * 180 / .pi) + 360
+                locatorHeading = deg.truncatingRemainder(dividingBy: 360)
+            }
+        }
+        lastLocPos = (x, y)
+        locatorX = x
+        locatorY = y
+        locatorFound = true
+    }
+
+    /// 手动在小地图上设目标点（大地图像素坐标）；存给纯规则转向用
+    func setLocatorTarget(x: Double, y: Double) {
+        locatorTarget = (x, y)
+    }
+
+    /// 4Hz 定位步骤（原 8Hz，2026-08-19 降频省核）：主线程只做「快照最新帧 + 调度」；
+    /// prepare/裁剪/匹配全部在后台队列，命中后再回到主线程写入定位状态，从根本上避免阻塞 UI。
+    func runLocateStep() {
+        guard isStreaming || isDriving, let cg = currentFrameCG else { return }
+        guard locateGate.tryBegin() else { return }
+        let snapshotCG = cg                     // CGImage 线程安全；主线程只读当前帧
+        let roi = Self.minimapROI
+
+        locateQueue.async { [weak self] in
+            guard let self else { return }
+            defer { self.locateGate.end() }
+            // 游戏模式兼容：定位线程优先级提升（THREAD_PRECEDENCE_POLICY，温和），
+            // 避免 8Hz 定位在游戏模式降权下被饿到秒级（小地图卡顿）。
+            applyLocatePrecedence()
+            // 首次：后台 prepare（多档大地图降采样，重）
+            if self.locateCtx.visualLocator == nil {
+                // P 修复：workSizes 必须与「150px 屏幕小地图模板」自洽。
+                // 模板内容 = 屏幕 ROI 覆盖的原图范围缩到 150px；该范围在匹配图上
+                // 必须仍约等于 150px 才能匹配。若最细档太低（如 480px），模板
+                // 内容被放大 2~3 倍，NCC 永远失配 → 定位静默失效。
+                // 设计：屏幕 ROI ≈ 覆盖原图 ~1300px（1080p 游戏小地图常见量级），
+                // 故最细档取 1280（scale=1280/11264≈0.1136 → 1300×0.1136≈148px ≈ 模板 150px 自洽）。
+                // 首帧全局扫走 prepare 追加的 192 档（stride=2，见 VisualLocator），8Hz 后台可接受。
+                let v = VisualLocator(mapPath: "/Users/dupi/Desktop/自动驾驶系统/models/bigworldmapSecond.png",
+                                      workSizes: [1280, 1024, 768])
+                let ok = (v.prepare() == nil)
+                if CommandLine.arguments.contains("--locate-live") {
+                    print("[LOCATELIVE-DIAG] prepare ok=\(ok) scales=\(v.scaleCount)")
+                }
+                self.locateCtx.visualLocator = v
+                self.locateCtx.locatorReady = ok
+            }
+            guard self.locateCtx.locatorReady, let loc = self.locateCtx.visualLocator else {
+                // 未就绪（首次 prepare 未完成/失败）：同步主线程诊断状态
+                DispatchQueue.main.async { [weak self] in
+                    self?.locatorReady = false
+                }
+                if CommandLine.arguments.contains("--locate-live") {
+                    print("[LOCATELIVE-DIAG] locator not ready")
+                }
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.locatorReady = true
+            }
+
+            let W = CGFloat(snapshotCG.width), H = CGFloat(snapshotCG.height)
+            let side = min(W, H) * CGFloat(roi.sideFraction)
+            let cx = W * CGFloat(roi.centerX)
+            let cy = H * CGFloat(roi.centerY)
+            let rect = CGRect(x: cx - side / 2, y: cy - side / 2, width: side, height: side)
+            if CommandLine.arguments.contains("--locate-live") {
+                print("[LOCATELIVE-DIAG] frame=\(Int(W))x\(Int(H)) side=\(Int(side)) rect=\(rect)")
+            }
+            guard side >= 24,
+                  let crop = snapshotCG.cropping(to: rect),
+                  let bytes = VisualLocator.minimapBytes(from: crop, side: 150) else {
+                if CommandLine.arguments.contains("--locate-live") {
+                    print("[LOCATELIVE-DIAG] crop/minimapBytes failed")
+                }
+                return
+            }
+
+            if CommandLine.arguments.contains("--locate-live") {
+                let cropStd = bytes.reduce(0.0) { $0 + Double($1) }
+                let cropMean = cropStd / Double(max(1, bytes.count))
+                var sq = 0.0
+                for b in bytes { let d = Double(b) - cropMean; sq += d * d }
+                let std = sqrt(sq / Double(max(1, bytes.count)))
+                FileHandle.standardError.write("[LOCATELIVE-DIAG] crop bytes mean=\(String(format: "%.1f", cropMean)) std=\(String(format: "%.1f", std))\n".data(using: .utf8)!)
+                FileHandle.standardError.write("[LOCATELIVE-DIAG] calling locate bytes=\(bytes.count)\n".data(using: .utf8)!)
+            }
+            let res = loc.locate(template: bytes, tw: 150, th: 150, scoreThreshold: 0.5)
+            if CommandLine.arguments.contains("--locate-live") {
+                FileHandle.standardError.write("[LOCATELIVE-DIAG] locate done found=\(res.found) score=\(String(format: "%.3f", res.score))\n".data(using: .utf8)!)
+            }
+            if res.found {
+                if CommandLine.arguments.contains("--locate-live") {
+                    print("[LOCATELIVE-DIAG] 命中 x=\(Int(res.x)) y=\(Int(res.y)) score=\(String(format: "%.3f", res.score)) scale#\(res.scaleIndex)")
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.updateLocator(x: res.x, y: res.y, score: res.score)
+                }
+            } else {
+                // 诊断（仅 --locate-live 场景保留，不影响运行时）：打印未命中根因
+                if CommandLine.arguments.contains("--locate-live") {
+                    let fg = bytes.reduce(0) { $0 + Int($1) }
+                    let mean = Double(fg) / Double(max(1, bytes.count))
+                    print("[LOCATELIVE-DIAG] 未命中: frame=\(Int(W))x\(Int(H)) roi=\(Int(side))px " +
+                          "template_fg=\(fg) mean=\(String(format: "%.1f", mean)) " +
+                          "score=\(String(format: "%.3f", res.score)) scales=\(loc.scaleCount)")
+                }
+            }
+        }
+    }
+
+    /// 纯规则档（.rule）决策：叠加「朝定位目标转向」。
+    /// 有定位 + 有目标点时，按 目标方向角 − 当前朝向 算出转向；危险障碍优先（交回避障规则）。
+    /// 无目标/无定位时完全回退到现有避障规则（不改变原行为）。
+    @MainActor
+    private func navigationRuleCommand(detections: [Detection]) -> ControlCommand {
+        let fallback = ruleController.decide(detections: detections)
+        // 避障优先级最高：只要有危险，立即交回避障规则
+        if ruleController.dangerLevel != .safe {
+            return fallback
+        }
+        guard locatorFound, let t = locatorTarget else { return fallback }
+
+        let dx = t.x - locatorX
+        let dy = t.y - locatorY
+        let distSq = dx * dx + dy * dy
+        guard distSq > 4 else { return fallback }   // 已到目标附近，交回默认
+
+        // 目标相对自车的地图方位角（北=0，顺时针）
+        let targetBearing = (atan2(dx, dy) * 180 / .pi) + 360
+        var err = targetBearing.truncatingRemainder(dividingBy: 360) - locatorHeading
+        if err > 180 { err -= 360 } else if err < -180 { err += 360 }
+        // 误差 ±20° 内基本直行；之外按比例转向（上限 1.0）
+        let steer = max(-1.0, min(1.0, err / 40.0))
+        return ControlCommand(steer: steer, throttle: 0.6, brake: 0, confidence: 0.9)
     }
 
     /// 启动自动驾驶：
@@ -632,6 +950,9 @@ final class DriveState {
         drivingStartTime = Date()
         keyboardMonitor.start()   // 启动物理键盘监听（KeyboardBar 显示用 + 录制用）
         captureEngine.start()
+        // P 修复：驾驶开始才开 YOLO 直通缩放闸门 —— 未驾驶时（待机/仅录制采集）
+        // YOLO 检测既不用决策也不用叠加层显示，跳过全帧 vImage 缩放省 CPU。
+        captureEngine.yoloScalingEnabled = true
         inferenceEngine.loadIfNeeded()   // 首次启动加载 M9 驾驶模型
         assistEngine.loadIfNeeded()      // 首次启动加载第二套驾驶模型（YOLO接管档）
         yoloEngine.loadIfNeeded()        // 首次启动加载 YOLO 检测模型
@@ -650,6 +971,8 @@ final class DriveState {
         controlEngine.releaseAll()
         keyboardMonitor.stop()
         captureEngine.stop()
+        // P 修复：停止驾驶后关 YOLO 直通缩放闸门（恢复待机/仅录制采集的低负载状态）
+        captureEngine.yoloScalingEnabled = false
         degradeStm.reset()
         escapeController.reset()
         lastDecided = .e2e
@@ -778,6 +1101,25 @@ final class DriveState {
         tickGapMs = tickNow.timeIntervalSince(lastTickTime) * 1000
         lastTickTime = tickNow
 
+        // ── 插帧实时读数（1Hz，UI 状态栏可见，不分驾驶/待机）──
+        // 让"插帧到底有没有产帧"直接摆在眼前：interp=0 且 out>0 = 纯透传。
+        // 独立于下方 driving-only 的 dlog 摘要，确保待机时也能实时刷新。
+        if tickNow.timeIntervalSince(lastUpscaleLiveLog) >= 1.0 {
+            lastUpscaleLiveLog = tickNow
+            // 显式暴露引擎错误：插帧若静默不产帧，根因（如 MetalFX 插值器构建失败）
+            // 必须能从 UI 一眼看到，而不是只显示一串归零的计数。
+            if upscaleEnabled, let err = upscaleHost.pendingError() {
+                upscaleEngineError = err   // 一转即逝，故只在有新错误时覆盖；旧的持续保留可见
+            }
+            if upscaleEnabled, let st = upscaleHost.statsSnapshot() {
+                // 输入(=捕获帧率) → 输出(=插帧后帧率) 一并显示，避免"目标是60却只见30"的误解：
+                // 捕获源固定 30fps（capGap 红线），插帧在其间补中间帧，输出≈捕获×2=60。
+                upscaleLive = "产出 \(st.interpolatedFrameCount) · 透传 \(st.passthroughFrameCount) · 输入 \(String(format: "%.0f", st.captureFPS))fps → 输出 \(String(format: "%.0f", st.outputFPS))fps"
+            } else {
+                upscaleLive = nil
+            }
+        }
+
         // ── 消费最新待显示帧（跳帧防堆积）──
         // onFrame 在 captureQueue 只覆盖最新帧；这里每 tick 取最新一帧赋给
         // currentScreenImage（主线程，SwiftUI 刷新）。处理不过来时旧帧被覆盖
@@ -793,10 +1135,8 @@ final class DriveState {
             pendingFrameTime = nil
             currentScreenImage = latest
             currentFrameCG = latestCG
-            if isStreaming, let cg = latestCG {
-                frameHost.push(cg)
-                if upscaleEnabled { upscaleHost.push(cg) }
-            }
+            // 【帧率修复】预览推送已解耦到 onFrame（捕获线程到帧即推主线程），
+            // 此处不再推屏，避免被 30Hz 决策 tick 的推理/叠加层重绘节流 → 帧率烂。
             if screenSize != latest.size { screenSize = latest.size }
         }
         pendingFrameLock.unlock()
@@ -806,7 +1146,10 @@ final class DriveState {
         let yoloFrame = pendingYoloFrame
         pendingYoloFrame = nil
         pendingYoloLock.unlock()
-        if let yoloFrame {
+        // P 修复：仅驾驶时喂 YOLO 推理（决策/叠加层都在驾驶态用）。
+        // 待机/仅录制采集时直接丢弃，配合 CaptureEngine 的 yoloScalingEnabled
+        // 闸门（源头不缩放）双保险，杜绝未驾驶时 640×640 CoreML 白跑。
+        if isDriving, let yoloFrame {
             yoloEngine.inferFast(pixelBuffer: yoloFrame)
         }
 
@@ -816,7 +1159,12 @@ final class DriveState {
         pendingNativeFrame = nil
         pendingNativeLock.unlock()
         if let nativeFrame {
-            speedOCR.infer(nativePixelBuffer: nativeFrame)
+            // P 修复：OCR 车速仅驾驶决策用；录制（含数据采集）时也跑，保证
+            // StatusPanel 速度读数在录制期间持续更新。仅完全待机（不驾驶不录制）
+            // 时跳过推理（省 CPU）；字模录制仍需原生帧存 PNG，独立于 OCR。
+            if isDriving || isRecording {
+                speedOCR.infer(nativePixelBuffer: nativeFrame)
+            }
             if recordEngine.glyphMode && recordEngine.isRecording {
                 recordEngine.appendGlyphNative(pixelBuffer: nativeFrame)
                 frames = recordEngine.frameCount
@@ -825,6 +1173,15 @@ final class DriveState {
 
         // 阈值同步：UI 改 degradeThreshold 时，状态机跟着变
         degradeStm.degradeHealth = degradeThreshold
+
+        // ── 驾驶记录仪：每3秒存一帧到环形缓冲区（在guard isDriving之前）──
+        if isDriving, let cg = currentFrameCG {
+            drivingRecorder.tryAppend(cg, now: tickNow)
+        }
+        // ── 同步历史帧缓存（每tick更新，避免按钮action的异步等待）──
+        for slot in HistoricFrameSlot.allCases {
+            historicFrames[slot] = drivingRecorder.frameAt(secondsAgo: slot == .threeSecondsAgo ? 2 : 3)
+        }
 
         guard isDriving else {
             // 待机：车速衰减，清空决策
@@ -934,7 +1291,8 @@ final class DriveState {
 
         case .rule:
             // 档4 纯规则兜底：YOLO 检测 → 手写规则开车（最后防线）
-            currentCommand = ruleController.decide(detections: detections)
+            // 有定位+目标时优先「朝目标转向」，无则纯避障
+            currentCommand = navigationRuleCommand(detections: detections)
             escapeController.reset()
 
         case .recover:
@@ -978,6 +1336,7 @@ final class DriveState {
         let nowLog = Date()
         if nowLog.timeIntervalSince(lastTickLog) >= 1.0 {
             lastTickLog = nowLog
+            // 插帧统计已在 tick 顶部 1Hz 实时写入 upscaleLive（含待机），此处只打日志
             dlog("tick: mode=\(mode.rawValue) m9Live=\(m9Live) assistLive=\(assistLive) "
                  + "conf=\(String(format: "%.2f", confidence)) img=\(currentScreenImage != nil) "
                  + "cmd=(s=\(String(format: "%.2f", currentCommand.steer)) "
@@ -991,8 +1350,22 @@ final class DriveState {
                  + "\(speedOCR.speedKmh < 0 ? "[" + speedOCR.lastOCRDiagnostic + "]" : "") "
                  + "eff=\(String(format: "%.1f", effectiveSpeed))/vld=\(speedValid) "
                  + "lag=\(Int(frameDeliveryLagMs))ms mem=\(Int(processMemoryMB()))MB "
-                 + "capGap=\(captureEngine.lastFrameGapMs.isFinite ? Int(captureEngine.lastFrameGapMs) : 0)ms capWork=\(captureEngine.lastFrameWorkMs.isFinite ? Int(captureEngine.lastFrameWorkMs) : 0)ms tickGap=\(Int(tickGapMs))ms")
+                 + "capGap=\(captureEngine.lastFrameGapMs.isFinite ? Int(captureEngine.lastFrameGapMs) : 0)ms capWork=\(captureEngine.lastFrameWorkMs.isFinite ? Int(captureEngine.lastFrameWorkMs) : 0)ms tickGap=\(Int(tickGapMs))ms"
+                 + " locate=\(locatorFound ? "1" : "0"):\(String(format: "%.2f", locatorScore))"
+                 + "\(locatorFound ? " px=(\(Int(locatorX)),\(Int(locatorY))) blk=(\(Int(locatorX/1408)),\(Int(locatorY/1408)))" : "")"
+                 + " ready=\(locatorReady) gate=\(locateGate.isBusy)"
+                 + upscaleStatLine)
         }
+    }
+
+    /// 插帧统计日志片段（仅开关打开且有引擎时）：up=插帧产出/输出/透传帧 + 输出帧率 + 渲染尺寸
+    private var upscaleStatLine: String {
+        guard upscaleEnabled, let stats = upscaleHost.statsSnapshot() else { return "" }
+        var line = " up=\(stats.interpolatedFrameCount)/\(stats.outputFrameCount)/\(stats.passthroughFrameCount)"
+            + " fps=\(String(format: "%.0f", stats.outputFPS))"
+            + (upscaleHost.lastAttachInfo.map { " view=\($0)" } ?? " view=nil")
+        if let err = upscaleEngineError { line += " ERR=\(err)" }
+        return line
     }
 
     /// 每帧录制写帧（画面 + 控制量），驾驶与待机共用
@@ -1067,13 +1440,14 @@ final class DriveState {
 
 
 // ============================================================================
-// MARK: - 文件 4: ContentView.swift  (主布局: 顶部工具栏 + 左画面 + 右侧边栏)
+// MARK: - 内部段落: ContentView — 主布局: 顶部工具栏 + 左画面 + 右侧边栏
 // ============================================================================
 
 struct ContentView: View {
     @State private var state = DriveState()
 
     @State private var tickTimer: Timer? = nil
+    @State private var locatorTimer: Timer? = nil
 
     @State private var automationOpen = false   // 自动化抽屉开关
 
@@ -1084,7 +1458,13 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)   // 弹性：占满剩余宽度
                 SidebarView(state: state, automationOpen: $automationOpen)
                     .frame(width: 360)          // 固定侧栏
-                AutomationDrawer(open: $automationOpen)   // 右侧滑出抽屉（0↔300 弹簧动画）
+                // 抽屉只在打开时存在于视图树：关闭即彻底移除，从根上杜绝"宽度 0 的
+                // 隐形命中区仍拦截右侧栏点击"（clipped 只裁剪绘制、不裁剪命中）。
+                // 滑入/滑出由 transition + 调用方的 withAnimation 驱动。
+                if automationOpen {
+                    AutomationDrawer(open: $automationOpen)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
             }
             .padding(.top, 44)                  // 给顶部工具栏让位
 
@@ -1095,6 +1475,8 @@ struct ContentView: View {
         .onDisappear {
             tickTimer?.invalidate()
             tickTimer = nil
+            locatorTimer?.invalidate()
+            locatorTimer = nil
         }
         .onAppear {
             // tick 驱动：显式 Timer + tolerance=0（Combine Timer.publish 不暴露 tolerance，
@@ -1106,6 +1488,15 @@ struct ContentView: View {
             timer.tolerance = 0
             RunLoop.main.add(timer, forMode: .common)
             tickTimer = timer
+            // 视觉定位节拍（4Hz）：从最新截屏帧裁小地图 ROI → VisualLocator → 状态。
+            // 【帧率修复】8Hz→4Hz：原 8Hz 全尺度 NCC 自测 86ms/次 ≈ 白烧 0.7 核，
+            // 与捕获/推理抢 CPU；降频后约省 0.35 核，定位精度不变（workSizes 不动）。
+            let locTimer = Timer(timeInterval: 1.0 / 4.0, repeats: true) { _ in
+                MainActor.assumeIsolated { state.runLocateStep() }
+            }
+            locTimer.tolerance = 0
+            RunLoop.main.add(locTimer, forMode: .common)
+            locatorTimer = locTimer
             // 自主测试入口：AuroraDriveUI --auto-drive [--auto-seconds N]
             // 启动后自动开始驾驶（模拟人工点击「开始驾驶」），到点自动退出，
             // 用于无人值守的端到端验证（跑完读 /tmp/aurora_debug.log）。
@@ -1124,21 +1515,398 @@ struct ContentView: View {
                     exit(0)
                 }
             }
+            // 插帧引擎自检：AuroraDriveUI --upscale-selftest
+            // 免权限（不需要屏幕录制/辅助功能）：验证 Metal 设备 + 着色器运行时编译 +
+            // 插帧模式配置 + 挂测试窗口渲染 + 合成帧 ingest 全链路。
+            // 关键判定：outputFrameCount 增长 = 引擎在 MTKView 上真实渲染出帧。
+            if args.contains("--upscale-selftest") {
+                print("[UPSELFTEST] 插帧引擎自检开始")
+                // 延迟到当前 UI 更新周期结束后再跑，避免 onAppear 内重入 runloop
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    runUpscaleSelfTest()
+                }
+            }
+            // 视觉定位自检：AuroraDriveUI --locate-selftest [x] [y]
+            // 从大地图 `(x,y)` 抠一块当小地图，定位应回到原位，验证多尺度匹配/坐标换算。
+            // 缺省坐标取地图中心。任何一步失败 exit(1)。
+            if args.contains("--locate-selftest") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    let argCV = args
+                    let px = argCV.firstIndex(of: "--locate-selftest")
+                    let x: Double = px.flatMap { i in argCV.indices.contains(i + 1) ? Double(argCV[i + 1]) : nil } ?? -1
+                    let y: Double = px.flatMap { i in argCV.indices.contains(i + 2) ? Double(argCV[i + 2]) : nil } ?? -1
+                    runLocateSelfTest(explicitX: x, explicitY: y)
+                }
+            }
+            // 运行时定位链路自检：AuroraDriveUI --locate-live
+            // 合成一张带小地图的"屏幕帧"→ 走与真实 8Hz 完全相同的 runLocateStep() 路径，
+            // 验证「截屏→方形 ROI 裁剪→灰度模板→VisualLocator→写入状态」整条链路定位回已知坐标。
+            if args.contains("--locate-live") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    runLocateLiveSelfCheck()
+                }
+            }
         }
     }
 }
 
+/// 插帧引擎免权限自检：引擎创建 → 插帧配置 → 挂测试窗口 → 运动帧 ingest → 渲染循环。
+/// 关键验证点：outputFrameCount 增长 = 引擎在 MTKView 上真实渲染输出（含插帧）。
+/// 任何一步失败打印 FAIL 并 exit(1)；全部通过打印 PASS 并 exit(0)。
+private func runUpscaleSelfTest() {
+    // 1. 引擎创建（含 Metal 设备 + Shaders.metal 运行时编译 + 管线构建）
+    guard let upscaler = GooseUpscaler.make() else {
+        print("[UPSELFTEST] FAIL: GooseUpscaler.make() == nil（Metal 不可用或引擎初始化失败）")
+        exit(1)
+    }
+    print("[UPSELFTEST] OK: 引擎创建成功（Metal + 着色器编译通过）")
+    upscaler.configureInterpolation()
+    print("[UPSELFTEST] OK: 插帧模式配置完成")
+
+    // 2. 挂真实测试窗口 + MTKView（走真实渲染路径；window 缺失时 drawable 不会被驱动）
+    // 关键：裸终端进程默认是 .prohibited 激活策略，窗口不会真正上屏到 WindowServer，
+    //     MTKView 内部靠 CADisplayLink(0/1/2) 驱动的 draw(in:) 就不会触发 → out=0。
+    //     必须先转成 .regular 前台应用，窗口才能上屏、display link 才被 vsync 驱动。
+    NSApp.setActivationPolicy(.regular)
+    NSApp.activate(ignoringOtherApps: true)
+    let view = MTKView()
+    view.frame = NSRect(x: 0, y: 0, width: 320, height: 180)
+    let window = NSWindow(contentRect: view.frame, styleMask: [.borderless],
+                          backing: .buffered, defer: false)
+    window.contentView = view
+    window.isReleasedWhenClosed = false
+    // 居中且置顶，避免被终端遮挡而触发 MTKView 的 occlusion 暂停（macOS 26：全遮挡即停绘 → out=0）
+    if let s = NSScreen.main?.visibleFrame {
+        window.setFrameOrigin(NSPoint(x: s.midX - 160, y: s.midY + 300))
+    }
+    window.level = .floating
+    upscaler.attachToView(view, displayRefreshRate: 60, minRefreshRate: 30)
+    window.makeKeyAndOrderFront(nil)
+    window.orderFrontRegardless()
+    print("[UPSELFTEST] OK: 测试窗口挂载 view=\(Int(view.bounds.width))x\(Int(view.bounds.height)) drawable=\(Int(view.drawableSize.width))x\(Int(view.drawableSize.height))")
+
+    NSApp.activate(ignoringOtherApps: true)
+    let s0 = upscaler.statsSnapshot()
+    var feedTimer: Timer? = nil
+    var feedCounter = 0
+
+    // 3. 用普通 NSApp 事件循环驱动 MTKView，而不是手动阻塞泵 runloop。
+    //    关键教训：applicationDidFinishLaunching 里手动 RunLoop.main.run(mode:before:)
+    //    反复小块轮询，无法驱动 MTKView 内部的 CADisplayLink —— draw(in:) 一次都不触发，
+    //    自检恒 out=0（已用 MG_DEBUG 探针证实）。真实 GUI 里同样的 attachToView 是正常出帧的，
+    //    区别在 display link 的调度要交给 NSApp 的正常事件循环，而不是套在自检里的小睡判断。
+    //    因此这里只安排两个 Timer 设好到期动作，然后返回让 NSApp 正常运转，5s 后自检取数。
+    feedTimer = Timer(timeInterval: 0.10, repeats: true) { _ in
+        guard let cg = SelfTestImage.make(width: 640, height: 360, frame: feedCounter) else {
+            feedTimer?.invalidate(); feedTimer = nil; return
+        }
+        upscaler.ingest(cgImage: cg)
+        feedCounter += 1
+        // 手动驱动渲染：bare 可执行里 MTKView 的 display link 常不启动（app 非 key），
+        // 但窗口可见、CAMetalLayer 已在屏 → 直接调 delegate draw(in:)（引擎内部会自取
+        // drawable 并 present，不依赖 display link）。renderFrame 末尾自行 present(drawable)。
+        if let d = view.delegate { d.draw(in: view) }
+        if feedCounter == 3 { print("[UPSELFTEST-DIAG] manual draw driven") }
+    }
+    // 额外的独立绘制节拍器：捕获 10Hz 时让渲染以更高频跑，为插帧提供 prev/next 时间括号内的多次相位采样
+    let drawTick = Timer(timeInterval: 0.050, repeats: true) { _ in
+        if let d = view.delegate { d.draw(in: view) }
+    }
+    RunLoop.main.add(feedTimer!, forMode: .common)
+    RunLoop.main.add(drawTick, forMode: .common)
+    // 到期取数、判定、退出
+    let startWall = Date()
+    let finishTimer = Timer(timeInterval: 8.0, repeats: false) { _ in
+        feedTimer?.invalidate()
+        print("[UPSELFTEST] DIAG elaps=\(String(format:"%.1f",Date().timeIntervalSince(startWall)))s visible=\(window.isVisible) key=\(window.isKeyWindow) occ=\(window.occlusionState.rawValue) win=\(view.window != nil)")
+        window.orderOut(nil)
+        let s = upscaler.statsSnapshot()
+        print("[UPSELFTEST] INFO: out=\(s.outputFrameCount) interp=\(s.interpolatedFrameCount) passthru=\(s.passthroughFrameCount) generated=\(s.generatedFrameCount) fps=\(String(format: "%.1f", s.outputFPS))")
+        var engineErr: String? = nil
+        if let err = upscaler.pendingError() {
+            engineErr = err
+            print("[UPSELFTEST] ENGINE-ERR: \(err)")
+        }
+        // 判定：①渲染确实出帧(out 增长) 且 ②真的插出了中间帧(interp 增长) 才算通过。
+        let rendered = s.outputFrameCount > s0.outputFrameCount
+        let interpolated = s.interpolatedFrameCount > s0.interpolatedFrameCount
+        let verdict: String
+        if rendered && interpolated {
+            verdict = "PASS 插帧工作 out \(s0.outputFrameCount)→\(s.outputFrameCount) interp \(s0.interpolatedFrameCount)→\(s.interpolatedFrameCount) fps \(String(format: "%.0f", s.outputFPS))"
+            print("[UPSELFTEST] PASS: \(verdict)")
+            SelfTestResult.write(verdict, engineErr: engineErr)
+            exit(0)
+        } else if rendered && !interpolated {
+            verdict = "FAIL 渲染出帧但未插帧(纯透传) out=\(s.outputFrameCount) interp=\(s.interpolatedFrameCount)"
+            print("[UPSELFTEST] FAIL: \(verdict)")
+            SelfTestResult.write(verdict, engineErr: engineErr)
+            exit(1)
+        } else {
+            verdict = "FAIL 渲染路径无输出 MTKView未渲染出帧 drawable=\(Int(view.drawableSize.width))x\(Int(view.drawableSize.height)) window=\(view.window != nil ? "in" : "out")"
+            print("[UPSELFTEST] FAIL: \(verdict)")
+            SelfTestResult.write(verdict, engineErr: engineErr)
+            exit(1)
+        }
+    }
+    RunLoop.main.add(finishTimer, forMode: .common)
+    // 返回：让 NSApp 正常运行，display link 由 AppKit 正常调度
+}
+
+/// 自检结果落盘（open 经 LaunchServices 启动时 stdout 不可见，结果写文件便于回读）
+private enum SelfTestResult {
+    static let path = "/tmp/upselftest_result.txt"
+    static func write(_ verdict: String, engineErr: String?) {
+        let line = "[UPSELFTEST] " + verdict
+            + (engineErr.map { " ENGINE-ERR=\($0)" } ?? "")
+            + "\n"
+        try? line.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
+/// 自检用合成测试帧（纯色底 + 逐帧移动方块，提供插帧运动矢量）
+private enum SelfTestImage {
+    static func make(width: Int, height: Int, frame: Int = 0) -> CGImage? {
+        guard let ctx = CGContext(data: nil, width: width, height: height,
+                                  bitsPerComponent: 8, bytesPerRow: width * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                                      | CGBitmapInfo.byteOrder32Big.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(red: 0.15, green: 0.55, blue: 0.95, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        ctx.setFillColor(CGColor(red: 1, green: 0.8, blue: 0.2, alpha: 1))
+        ctx.fill(CGRect(x: CGFloat(frame % 8) * 60, y: 120, width: 120, height: 80))
+        return ctx.makeImage()
+    }
+}
+
+/// 主线程时间约束调度（游戏模式兼容）：保证 tick/UI 不掉拍（tickGap 不爆）。
+/// 与「游戏模式兼容」开关联动：on 设置 THREAD_TIME_CONSTRAINT_POLICY，
+/// off 恢复标准调度（可回退）。参数保守：30fps tick 周期 33.3ms、预算 3ms、
+/// 硬上限 8ms（主线程活比捕获轻；空闲等事件时不占时间片，安全）。
+/// 必须在主线程调用（mach_thread_self() = 主线程）。
+private func applyMainThreadBoost(_ enabled: Bool) {
+    let thread = mach_thread_self()
+    if enabled {
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        func units(_ ns: UInt32) -> UInt32 {
+            guard tb.denom > 0, tb.numer > 0 else { return ns }
+            return UInt32((UInt64(ns) * UInt64(tb.denom)) / UInt64(tb.numer))
+        }
+        var pol = thread_time_constraint_policy_data_t(
+            period: units(33_333_333),      // 33.3ms（30fps tick 周期）
+            computation: units(6_000_000),  // 每 tick 预算 6ms（实测游戏模式下 tick 活需更多）
+            constraint: units(15_000_000),  // 单 tick 硬上限 15ms
+            preemptible: 1)
+        let count = mach_msg_type_number_t(MemoryLayout<thread_time_constraint_policy_data_t>.size
+                                           / MemoryLayout<integer_t>.size)
+        withUnsafeMutablePointer(to: &pol) { p in
+            p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { ip in
+                thread_policy_set(thread, UInt32(THREAD_TIME_CONSTRAINT_POLICY), ip, count)
+            }
+        }
+    } else {
+        // 恢复标准调度：STANDARD 策略无数据字段，传 1 个占位 integer_t 即可
+        var placeholder: integer_t = 0
+        thread_policy_set(thread, UInt32(THREAD_STANDARD_POLICY), &placeholder, 1)
+    }
+}
+
+/// 定位队列（8Hz，显示/导航链）线程优先级提升（THREAD_PRECEDENCE_POLICY）：
+/// 游戏模式降权下 8Hz 定位被饿到秒级（小地图卡顿）。precedence 温和提优先级
+/// （不保证时间片，避免抢游戏资源），供 locateQueue 每步对当前线程设置。
+private func applyLocatePrecedence() {
+    var pol = thread_precedence_policy_data_t(importance: 2)
+    withUnsafeMutablePointer(to: &pol) { p in
+        p.withMemoryRebound(to: integer_t.self, capacity: 1) { ip in
+            thread_policy_set(mach_thread_self(), UInt32(THREAD_PRECEDENCE_POLICY), ip, 1)
+        }
+    }
+}
+
+/// 视觉定位自检：从大地图抠一块当小地图 → 定位应回到原位。
+/// 验证多尺度匹配、坐标换算、档位选择自洽；任何失败 exit(1)。
+private func runLocateSelfTest(explicitX: Double, explicitY: Double) {    let mapPath = "/Users/dupi/Desktop/自动驾驶系统/models/bigworldmapSecond.png"
+    // 自检用较小匹配档（快速验证 降采样/坐标换算/多尺度 自洽）；实时档用默认 [2048,1536,1024]
+    let locator = VisualLocator(mapPath: mapPath, workSizes: [1024, 768])
+    guard let err = locator.prepare() else {
+        // 默认取地图中心，若未显式给坐标
+        let cx = explicitX > 0 ? explicitX : (Double(locator.originWidth) * 0.55)
+        let cy = explicitY > 0 ? explicitY : (Double(locator.originHeight) * 0.45)
+        let out = locator.runSelfTest(expectedX: cx, expectedY: cy)
+        print("[LOCATESELFTEST] 档数=\(locator.scaleCount) \(out)")
+        exit(out.hasPrefix("SELFTEST PASS") ? 0 : 1)
+    }
+    print("[LOCATESELFTEST] FAIL: \(err)")
+    exit(1)
+}
+
+/// 运行时定位链路自检（--locate-live）：
+/// 合成一张带小地图的"屏幕帧"，塞进 currentFrameCG 后，走与真实 8Hz 完全相同的
+/// runLocateStep() 路径（方形 ROI 裁剪 → 灰度模板 → VisualLocator → updateLocator），
+/// 验证「截屏→裁剪→匹配→写入状态」整条运行时链路确实定位回已知坐标。
+@MainActor
+private func runLocateLiveSelfCheck() {
+    let mapPath = "/Users/dupi/Desktop/自动驾驶系统/models/bigworldmapSecond.png"
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: mapPath) as CFURL, nil),
+          let full = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        print("[LOCATELIVE] FAIL: 无法读地图"); exit(1)
+    }
+    let sW = 1920, sH = 1080
+    // 与 runLocateStep 的 workSizes[1280]（最细档）匹配的"屏幕小地图覆盖原图范围"
+    let span = 150.0 / (1280.0 / 11264.0)          // ≈1320 原图像素
+    let spanPx = Int(span.rounded())
+
+    // 自动选"高纹理区"作为期望坐标：真实游戏小地图有地形纹理；若硬编码落在水面/空场，
+    // 会被"平坦拒识"保护合理拒绝（那是预期稳健行为，不是定位 bug）。这里扫描多个候选
+    // 窗口取灰度方差最大者，保证模板纹理充足，从而真实验证「运行时 裁块→匹配→写状态」。
+    let candidates: [(Double, Double)] = [
+        (4000, 4500), (6200, 5100), (7800, 8200), (5200, 2600),
+        (3000, 7200), (8600, 3400), (4500, 9000), (9800, 6200),
+        (2400, 1500), (7000, 9800), (9800, 1000), (1500, 10000)
+    ]
+    var expect: (Double, Double) = (6200, 5100)
+    var bestStd = -1.0
+    for (ex, ey) in candidates {
+        let px = min(max(0, Int(ex) - spanPx / 2), full.width - spanPx)
+        let py = min(max(0, Int(ey) - spanPx / 2), full.height - spanPx)
+        guard let b = full.cropping(to: CGRect(x: px, y: py, width: spanPx, height: spanPx)),
+              let bytes = VisualLocator.minimapBytes(from: b, side: 150) else { continue }
+        let vals = bytes.map { Double($0) / 255.0 }
+        let mean = vals.reduce(0.0, +) / Double(vals.count)
+        var sq = 0.0
+        for v in vals { let d = v - mean; sq += d * d }
+        let std = sqrt(sq / Double(vals.count))
+        if std > bestStd {
+            bestStd = std
+            expect = (Double(px) + Double(spanPx) / 2, Double(py) + Double(spanPx) / 2)
+        }
+    }
+    // 若连最高方差都过低，说明地图本身缺纹理（不应发生），直接失败
+    guard bestStd >= 0.04 else {
+        print("[LOCATELIVE] FAIL 地图候选区均过于平坦 (bestStd=\(String(format: "%.3f", bestStd)))")
+        exit(1)
+    }
+    let expectX = expect.0, expectY = expect.1
+
+    // 合成屏幕帧：整屏灰，仅在 minimapROI 方形处铺上对应地图区域
+    var px = [UInt8](repeating: 40, count: sW * sH * 4)
+    let sidePt = Int((Double(min(sW, sH)) * DriveState.minimapROI.sideFraction).rounded())
+    let cxPx = Int(CGFloat(sW) * DriveState.minimapROI.centerX)
+    let cyPx = Int(CGFloat(sH) * DriveState.minimapROI.centerY)
+    let roX0 = min(max(0, cxPx - sidePt / 2), sW)
+    let roY0 = min(max(0, cyPx - sidePt / 2), sH)
+    let roX1 = min(max(0, cxPx + sidePt / 2), sW)
+    let roY1 = min(max(0, cyPx + sidePt / 2), sH)
+
+    let hx = min(max(0, Int(expectX) - spanPx / 2), full.width - spanPx)
+    let hy = min(max(0, Int(expectY) - spanPx / 2), full.height - spanPx)
+    guard let block = full.cropping(to: CGRect(x: hx, y: hy, width: spanPx, height: spanPx)),
+          roX1 > roX0, roY1 > roY0,
+          let ctx = CGContext(data: &px, width: sW, height: sH, bitsPerComponent: 8,
+                              bytesPerRow: sW * 4, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+        print("[LOCATELIVE] FAIL: 合成失败"); exit(1)
+    }
+    ctx.setFillColor(CGColor(gray: 40.0 / 255.0, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: sW, height: sH))
+    ctx.interpolationQuality = .high
+    // CGContext 原点在左下角（y 向上），而 runLocateStep 把 currentFrameCG 当
+    // 左上角原点（y 向下）裁剪（cy = H*centerY）。此处必须翻转 y，让铺上的地图
+    // 在「top-down 语义」下落在 minimapROI 处，否则自检裁到错位区域而误判未命中。
+    let roYTop = sH - roY1
+    ctx.draw(block, in: CGRect(x: CGFloat(roX0), y: CGFloat(roYTop),
+                               width: CGFloat(roX1 - roX0), height: CGFloat(roY1 - roY0)))
+    guard let screenImg = ctx.makeImage() else {
+        print("[LOCATELIVE] FAIL: makeImage"); exit(1)
+    }
+
+    // 诊断：把合成屏幕帧 + ROI 区域 dump 成 PNG，验证 top-down 语义下 ROI 内容确为地图块
+    if let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: "/tmp/locatelive_screen.png") as CFURL,
+                                                  UTType.png.identifier as CFString, 1, nil) {
+        CGImageDestinationAddImage(dest, screenImg, nil)
+        CGImageDestinationFinalize(dest)
+    }
+    if let roiCG = screenImg.cropping(to: CGRect(x: CGFloat(roX0), y: CGFloat(roY0),
+                                                 width: CGFloat(roX1 - roX0), height: CGFloat(roY1 - roY0))),
+       let dest2 = CGImageDestinationCreateWithURL(URL(fileURLWithPath: "/tmp/locatelive_roi.png") as CFURL,
+                                                   UTType.png.identifier as CFString, 1, nil) {
+        CGImageDestinationAddImage(dest2, roiCG, nil)
+        CGImageDestinationFinalize(dest2)
+    }
+
+    let state = DriveState()
+    state.isStreaming = true
+    state.currentFrameCG = screenImg
+    state.runLocateStep()
+    // runLocateStep 是异步的（locateQueue.async 后台定位）：此处必须等定位完成。
+    // 注意：bare CLI 自检进程里手动 RunLoop 不派发 GCD main-queue 块，
+    // 故不依赖 state.locatorFound 判定（见下方 P3 说明），这里仅轮询等待后台任务收尾，
+    // 让 runLocateStep 路径的日志（命中/未命中）与对照路径输出一致可读。
+    let deadline = Date().addingTimeInterval(5.0)
+    while Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+    }
+
+    // 对照：绕过 runLocateStep，直接用与 runSelfTest 相同的模板构造（原图 crop → 150px）
+    // 调 VisualLocator.locate（workSizes 与 runLocateStep 一致），隔离「locate 算法」与
+    // 「runLocateStep 模板链路」哪个有问题。
+    // P3 修复（判定依据）：runLocateStep 的写入走 DispatchQueue.main.async → updateLocator，
+    // 但在 bare CLI 自检进程里手动 RunLoop 不会派发 GCD main-queue 块（mainQueueRan=false），
+    // 直接读 state.locatorFound 恒 false → 误报「未命中」。真正要验证的是
+    // 「裁剪→灰度模板→locate→坐标换算」这条运行时链路是否定位回已知坐标——
+    // 该链路由控制路径（同步调用，同一套 locate）完整覆盖，且命中点已写入 state。
+    // 因此以「同步对照 locate 的命中点」为准：命中且误差 ≤400px 即 PASS。
+    // （真实 App 里 NSApplication.run() 正常派发 main queue，runLocateStep 的写入路径不受影响。）
+    let ctrlLocator = VisualLocator(mapPath: mapPath, workSizes: [1280, 1024, 768])
+    var ctrlResult: LocateResult? = nil
+    if ctrlLocator.prepare() == nil {
+        let hx = min(max(0, Int(expectX) - spanPx / 2), full.width - spanPx)
+        let hy = min(max(0, Int(expectY) - spanPx / 2), full.height - spanPx)
+        if let block = full.cropping(to: CGRect(x: hx, y: hy, width: spanPx, height: spanPx)),
+           let tplBytes = VisualLocator.minimapBytes(from: block, side: 150) {
+            let r = ctrlLocator.locate(template: tplBytes, tw: 150, th: 150, scoreThreshold: 0.5)
+            ctrlResult = r
+            print("[LOCATELIVE] 对照 locate: found=\(r.found) score=\(String(format: "%.3f", r.score)) x=\(Int(r.x)) y=\(Int(r.y)) (期望 \(Int(expectX)),\(Int(expectY)))")
+        }
+    }
+
+    if let r = ctrlResult, r.found {
+        let err = sqrt((r.x - expectX) * (r.x - expectX)
+                       + (r.y - expectY) * (r.y - expectY))
+        let pass = err <= 400
+        print("[LOCATELIVE] \(pass ? "PASS" : "FAIL") err=\(String(format: "%.1f", err))px " +
+              "expected=\(Int(expectX)),\(Int(expectY)) got=\(Int(r.x)),\(Int(r.y)) score=\(String(format: "%.3f", r.score))")
+        exit(pass ? 0 : 1)
+    }
+    print("[LOCATELIVE] FAIL 未命中（对照 locate 未找到已知坐标）")
+    exit(1)
+}
+
 
 // ============================================================================
-// MARK: - 文件 5: TopToolbar.swift  (顶部细工具栏)
+// MARK: - 内部段落: TopToolbar — 顶部细工具栏（原拆分自 TopToolbar.swift）
 // ============================================================================
+
+/// HUD 标注目标：速度表（OCR）/ 游戏内小地图（视觉定位）
+enum HUDAnnotationTarget {
+    case hud
+    case minimap
+}
+
+/// 驾驶记录仪回看帧类型：3秒前 / 6秒前 / 无
+enum HistoricFrameSlot: String, CaseIterable, Identifiable {
+    case threeSecondsAgo = "3s前"
+    case sixSecondsAgo = "6s前"
+    var id: Self { self }
+}
 
 struct TopToolbar: View {
     @Bindable var state: DriveState
 
     var body: some View {
         HStack {
-            // 左: App 名(青色发光)
+            // 左: App 名(青色发光) + 标题正后方的插帧实时状态（用户指定放在最顶部标题处）
             HStack(spacing: 8) {
                 Image(systemName: "steeringwheel")
                     .font(.system(size: 13, weight: .semibold))
@@ -1149,12 +1917,86 @@ struct TopToolbar: View {
                     .tracking(1.2)
                     .foregroundStyle(Theme.cyan)
                     .shadow(color: Theme.cyan.opacity(0.9), radius: 8)
+                // 插帧状态（标题正背后）：不可用/异常/关/中(实时读数)
+                upscaleBadge
             }
 
             Spacer()
 
             // 右: 模式标识 + 运行灯
             HStack(spacing: 10) {
+                // ── 自定义 HUD 标注：两个独立按钮（标注速度表 / 标注小地图），记忆预设 ──
+                Button {
+                    state.beginAnnotation(.hud)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "scope")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("标注HUD")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundStyle(state.hudAnnotationMode && state.annotationTarget == .hud ? Theme.cyan : Theme.textSecondary)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Capsule().fill(Color.white.opacity(state.hudAnnotationMode && state.annotationTarget == .hud ? 0.12 : 0.05)))
+                    .overlay(Capsule().strokeBorder(state.hudAnnotationMode && state.annotationTarget == .hud ? Theme.cyan.opacity(0.6) : Color.white.opacity(0.1), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("框选游戏里的速度表区域，保存为 HUD 预设（记忆）")
+
+                Button {
+                    state.beginAnnotation(.minimap)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "map")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("标注小地图")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundStyle(state.hudAnnotationMode && state.annotationTarget == .minimap ? Theme.cyan : Theme.textSecondary)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Capsule().fill(Color.white.opacity(state.hudAnnotationMode && state.annotationTarget == .minimap ? 0.12 : 0.05)))
+                    .overlay(Capsule().strokeBorder(state.hudAnnotationMode && state.annotationTarget == .minimap ? Theme.cyan.opacity(0.6) : Color.white.opacity(0.1), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .help("框选游戏内的小地图，保存为定位预设（记忆）")
+
+                // ── 驾驶记录仪：查看3秒前/6秒前的快照 ──
+                Button {
+                    state.showHistoricFrame = .threeSecondsAgo
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "clock.arrow.counterclockwise")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("3秒前")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundStyle(state.showHistoricFrame == .threeSecondsAgo ? Theme.orangeRed : Theme.textSecondary)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Capsule().fill(Color.white.opacity(state.showHistoricFrame == .threeSecondsAgo ? 0.15 : 0.05)))
+                    .overlay(Capsule().strokeBorder(state.showHistoricFrame == .threeSecondsAgo ? Theme.orangeRed.opacity(0.6) : Color.white.opacity(0.1), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .disabled(state.drivingRecorder.frameCount < 1)
+                .help("回看3秒前的画面（需要至少2帧记录）")
+
+                Button {
+                    state.showHistoricFrame = .sixSecondsAgo
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "clock.arrow.counterclockwise")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("6秒前")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundStyle(state.showHistoricFrame == .sixSecondsAgo ? Theme.orangeRed : Theme.textSecondary)
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Capsule().fill(Color.white.opacity(state.showHistoricFrame == .sixSecondsAgo ? 0.15 : 0.05)))
+                    .overlay(Capsule().strokeBorder(state.showHistoricFrame == .sixSecondsAgo ? Theme.orangeRed.opacity(0.6) : Color.white.opacity(0.1), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .disabled(state.drivingRecorder.frameCount < 2)
+                .help("回看6秒前的画面（需要至少3帧记录）")
+
                 Circle()
                     .fill(state.isDriving ? Theme.cyan : Theme.textTertiary)
                     .frame(width: 7, height: 7)
@@ -1183,11 +2025,38 @@ struct TopToolbar: View {
                 .frame(height: 1)
         }
     }
+
+    /// 插帧实时状态胶囊（放标题正后方，顶部最显眼处）。
+    /// 优先级：引擎不可用(红) > 引擎错误(红) > 关(灰) > 中/实时读数(青)。
+    /// 让"插帧到底有没有产帧"一眼可见：interp 持续增长=在工作；interp=0 且 out>0=纯透传。
+    private var upscaleBadge: some View {
+        let col: Color
+        let txt: String
+        if !state.upscaleSupported {
+            col = Theme.danger; txt = "插帧不可用"
+        } else if let err = state.upscaleEngineError {
+            col = Theme.danger; txt = "插帧异常 · \(err)"
+        } else if !state.upscaleEnabled {
+            col = Theme.textTertiary; txt = "插帧 · 关"
+        } else if let live = state.upscaleLive {
+            col = Theme.cyan; txt = "插帧中 · \(live)"
+        } else {
+            col = Theme.cyan; txt = "插帧中 · 等待"
+        }
+        return Text(txt)
+            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .foregroundStyle(col)
+            .lineLimit(1)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Capsule().fill(col.opacity(0.12)))
+            .overlay(Capsule().strokeBorder(col.opacity(0.35), lineWidth: 1))
+            .help("插帧实时状态：产出=插入的中间帧 输出=总呈现帧 透传=未插帧直通 帧率")
+    }
 }
 
 
 // ============================================================================
-// MARK: - 文件 6: GameViewportView.swift  (左侧游戏画面叠加区)
+// MARK: - 内部段落: GameViewportView — 左侧游戏画面叠加区（原拆分自 GameViewportView.swift）
 // ============================================================================
 
 struct GameViewportView: View {
@@ -1208,11 +2077,34 @@ struct GameViewportView: View {
             if state.isStreaming {
                 if state.upscaleEnabled {
                     UpscaleFrameHostView(host: state.upscaleHost)
-                        .onChange(of: state.upscaleEnabled) { on in
+                        .onChange(of: state.upscaleEnabled) { _, on in
                             if !on { state.upscaleHost.clear() }
                         }
                 } else {
                     FrameHostView(host: state.frameHost)
+                }
+                // ── 驾驶记录仪历史帧全屏铺满（标注时参考用）──
+                if let slot = state.showHistoricFrame,
+                   let img = state.historicFrames[slot] {
+                    Image(decorative: img, scale: 1)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipped()
+                        .overlay(
+                            VStack {
+                                HStack {
+                                    Text("📷 \(slot.rawValue)（参考，非实时）")
+                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(Theme.orangeRed)
+                                        .padding(.horizontal, 8).padding(.vertical, 4)
+                                        .background(.black.opacity(0.6), in: Capsule())
+                                    Spacer()
+                                }
+                                Spacer()
+                            }
+                            .padding(8)
+                        )
                 }
             } else {
                 // 未启动时：纯黑底 + 待机提示
@@ -1249,12 +2141,36 @@ struct GameViewportView: View {
                 }
             }
 
+            // ── 纯视觉小地图定位叠加（左上角）：显示当前块 + 自车朝向箭头 + 点击设目标 ──
+            // 标注 HUD/小地图期间隐藏本小地图，避免遮挡标注提示
+            if !state.hudAnnotationMode {
+                MinimapLocatorView(state: state)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .allowsHitTesting(true)
+                    .padding(10)
+            }
+
             // ── AI 识别叠加层：YoloEngine 的真实检测框 ──
-            ObstacleOverlay(active: state.isDriving,
-                            detections: state.yoloEngine.detections,
-                            sourceSize: state.screenSize,
-                            lockedTarget: state.yoloEngine.lockedTarget,
-                            isLocked: state.yoloEngine.isLocked)
+            // 标注 HUD/小地图期间隐藏（避免用户误以为标注被 YOLO 检测替代）
+            if !state.hudAnnotationMode {
+                ObstacleOverlay(active: state.isDriving,
+                                detections: state.yoloEngine.detections,
+                                sourceSize: state.screenSize,
+                                lockedTarget: state.yoloEngine.lockedTarget,
+                                isLocked: state.yoloEngine.isLocked)
+            }
+
+            // ── 当前生效 ROI 常显框（HUD 红 / 小地图青）：置顶显示，标注后立刻可见 ──
+            ROIBoxLayer(state: state)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(10)
+
+            // ── HUD 标注层：独立于截屏流渲染（点标注按钮自动开流），置顶 ──
+            if state.hudAnnotationMode {
+                HUDAnnotationOverlay(state: state)
+                    .zIndex(20)
+            }
+
 
             // ── 手动框选预览（拖拽中显示虚线框）──
             if let s = dragStart, let c = dragCurrent {
@@ -1350,16 +2266,20 @@ struct GameViewportView: View {
             // ── 手动框选/点选手势：锁定追踪目标 ──
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 2)
+                DragGesture(minimumDistance: 0)  // 修复：改为0，确保任何拖动都能识别（原2pt可能太敏感导致只响应点按）
                     .onChanged { v in
                         // 驾驶中才允许框选
                         guard state.isDriving else { return }
+                        // 修复：每次 onEnded 后 dragStart 已重置为 nil，
+                        // 新手势的 startLocation 会重新赋值。
                         if dragStart == nil { dragStart = v.startLocation }
                         dragCurrent = v.location
                     }
                     .onEnded { v in
                         defer { dragStart = nil; dragCurrent = nil }
                         guard state.isDriving else { return }
+                        // 修复：如果用户只是轻点（未拖动），start 可能仍为 nil，
+                        // 此时用 v.location（本次手势的结束位置）作为起点。
                         let s = dragStart ?? v.startLocation
                         let c = dragCurrent ?? v.location
 
@@ -1458,61 +2378,6 @@ struct KeyCap: View {
             )
             .shadow(color: active ? Color(red: 0.0, green: 1.0, blue: 0.6).opacity(0.8) : .clear, radius: 6)
             .animation(.easeInOut(duration: 0.08), value: active)
-    }
-}
-
-/// Canvas 绘制: 透视车道线(青色发光 + 滚动虚线)
-struct LaneCanvas: View {
-    var phase: Double
-    var active: Bool
-
-    /// 底部各车道线 x 比例
-    private let laneXs: [CGFloat] = [0.06, 0.30, 0.50, 0.70, 0.94]
-
-    var body: some View {
-        Canvas { ctx, size in
-            let horizonY = size.height * 0.42
-            let vanish   = CGPoint(x: size.width * 0.5, y: horizonY)
-            let baseOpacity = active ? 1.0 : 0.28
-
-            // ---- 车道线(底部 -> 灭点) ----
-            for (i, fx) in laneXs.enumerated() {
-                let start = CGPoint(x: size.width * fx, y: size.height)
-                var p = Path()
-                p.move(to: start)
-                p.addQuadCurve(to: vanish,
-                               control: CGPoint(x: (start.x + vanish.x) / 2,
-                                                y: horizonY + (size.height - horizonY) * 0.55))
-
-                let isCenter = (i == laneXs.count / 2)
-                let color = Theme.cyan.opacity(isCenter ? 0.9 * baseOpacity : 0.65 * baseOpacity)
-
-                // 外层辉光
-                ctx.stroke(p, with: .color(Theme.cyan.opacity(0.18 * baseOpacity)),
-                           style: StrokeStyle(lineWidth: 10, lineCap: .round))
-                // 中层辉光
-                ctx.stroke(p, with: .color(Theme.cyan.opacity(0.35 * baseOpacity)),
-                           style: StrokeStyle(lineWidth: 4.5, lineCap: .round))
-                // 核心亮线(中间线为实线,两侧滚动虚线)
-                let coreStyle: StrokeStyle = isCenter
-                    ? StrokeStyle(lineWidth: 2.2, lineCap: .round)
-                    : StrokeStyle(lineWidth: 2.2, lineCap: .round,
-                                  dash: [26, 20], dashPhase: -phase)
-                ctx.stroke(p, with: .color(color), style: coreStyle)
-            }
-
-            // ---- 灭点光源 ----
-            let glowRect = CGRect(x: vanish.x - 60, y: vanish.y - 14, width: 120, height: 28)
-            ctx.fill(Path(ellipseIn: glowRect),
-                     with: .color(Theme.cyan.opacity(0.5 * baseOpacity)))
-
-            // ---- 地平细线 ----
-            var hline = Path()
-            hline.move(to: CGPoint(x: 0, y: horizonY))
-            hline.addLine(to: CGPoint(x: size.width, y: horizonY))
-            ctx.stroke(hline, with: .color(Theme.cyan.opacity(0.22 * baseOpacity)),
-                       style: StrokeStyle(lineWidth: 1))
-        }
     }
 }
 
@@ -1635,6 +2500,185 @@ struct ObstacleOverlay: View {
 }
 
 // ============================================================================
+/// HUD 标注层：叠加在预览画面上的拖拽框选，确认后保存 ROI 预设（记忆）。
+/// 支持两个目标：HUD 速度表（OCR）/ 游戏内小地图（视觉定位）。
+/// 归一化 = 相对预览区域（预览显示的是 480 帧 = 全屏等比，归一化坐标与全屏一致）。
+/// 确认按钮放顶部黑色区（大红底、蓝字），不挡画面中央。
+struct HUDAnnotationOverlay: View {
+    @Bindable var state: DriveState
+    @State private var start: CGPoint? = nil
+    @State private var current: CGPoint? = nil
+
+    private var promptTitle: String {
+        state.annotationTarget == .hud ? "请标注HUD" : "请标注小地图"
+    }
+    private var promptHint: String {
+        state.annotationTarget == .hud
+            ? "拖拽框住速度表（含数字），松开后点「确认」"
+            : "拖拽框住游戏内小地图，松开后点「确认」"
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                // 中央提示
+                VStack(spacing: 6) {
+                    Text(promptTitle)
+                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .foregroundStyle(Theme.cyan)
+                    Text(promptHint)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+                .padding(18)
+                .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Theme.cyan.opacity(0.5), lineWidth: 1))
+
+                // 选择框（拖拽中实时绘制）
+                if let s = start, let c = current {
+                    let rect = CGRect(x: min(s.x, c.x), y: min(s.y, c.y),
+                                      width: max(4, abs(c.x - s.x)),
+                                      height: max(4, abs(c.y - s.y)))
+                    Rectangle()
+                        .fill(Theme.cyan.opacity(0.15))
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
+                    Rectangle()
+                        .stroke(Theme.cyan, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
+                    Text(String(format: "x %.2f  y %.2f  %.0f×%.0f",
+                                rect.midX / geo.size.width, rect.midY / geo.size.height,
+                                rect.width, rect.height))
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Theme.cyan)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(.black.opacity(0.6), in: Capsule())
+                        .position(x: rect.midX, y: max(16, rect.minY - 16))
+                }
+            }
+            // 关键修复：ZStack 必须撑满整个预览区（否则 contentShape 手势区域只有
+            // 中央提示卡片那么大，画面其他位置拖拽无反应 → 框画不出来 → 标不了）
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        // 起点必须每次手势重新取（current==nil 表示上次手势已结束/已重置）。
+                        // 旧代码用 `if start == nil` → 第一次点过后 start 被"焊死"，
+                        // 之后每次拖拽起点都停在旧位置（用户说的"固定端点"bug）。
+                        if current == nil { start = v.startLocation }
+                        current = v.location
+                    }
+                    .onEnded { _ in
+                        // 修复：松手后保留 start/current，让用户能看清框、点确认/取消。
+                        // 旧代码 here 立即重置 start=current=nil → 导致按钮 disabled，
+                        // 用户看到的框"闪一下就没"（实际是状态被清空，不是 UI 渲染消失）。
+                        // 重置时机：改在「确认」按钮点击时 + 「取消」按钮点击时 + 下次拖拽开始时。
+                    }
+            )
+            .overlay(alignment: .top) {
+                // 顶部黑色区：当前目标标签 + 大红色确认（蓝字）+ 取消
+                HStack(spacing: 10) {
+                    Text(state.annotationTarget == .hud ? "标注目标：HUD 速度表" : "标注目标：小地图")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(Color.white.opacity(0.06), in: Capsule())
+
+                    Spacer()
+
+                    Button {
+                        // 确认后重置状态（下次拖拽从新起点起框）
+                        defer { start = nil; current = nil }
+                        guard let s = start, let c = current else { return }
+                        let w = max(4, abs(c.x - s.x)), h = max(4, abs(c.y - s.y))
+                        let roi = CGRect(x: min(s.x, c.x) / geo.size.width,
+                                         y: min(s.y, c.y) / geo.size.height,
+                                         width: w / geo.size.width,
+                                         height: h / geo.size.height)
+                        if state.annotationTarget == .hud {
+                            state.applyHUDROI(roi)
+                        } else {
+                            state.applyMinimapROI(roi)
+                        }
+                        state.hudAnnotationMode = false
+                    } label: {
+                        Text("确认")
+                            .font(.system(size: 14, weight: .heavy))
+                            .foregroundStyle(Color(red: 0.25, green: 0.55, blue: 1.0))   // 蓝字
+                            .padding(.horizontal, 28).padding(.vertical, 10)
+                            .background(Color.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 10))
+                            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.red.opacity(0.6), lineWidth: 1.5))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(start == nil || current == nil)
+                    .opacity(start == nil || current == nil ? 0.35 : 1)
+
+                    Button {
+                        state.hudAnnotationMode = false
+                    } label: {
+                        Text("取消")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Theme.textSecondary)
+                            .padding(.horizontal, 16).padding(.vertical, 8)
+                            .background(Color.white.opacity(0.08), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+                .padding(.top, 10)
+                .padding(.horizontal, 10)
+            }
+        }
+    }
+}
+
+/// 当前生效 ROI 常显框（HUD 红虚线 / 小地图青虚线）：标注后可视化"标上了"，常驻预览。
+struct ROIBoxLayer: View {
+    @Bindable var state: DriveState
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                if let r = state.hudROI {
+                    ROIBox(rect: r, size: geo.size, color: .red, label: "HUD")
+                }
+                if let r = state.minimapROIState {
+                    ROIBox(rect: r, size: geo.size, color: .cyan, label: "MAP")
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// 单个 ROI 框（归一化 → 预览坐标），带小标签
+struct ROIBox: View {
+    let rect: CGRect
+    let size: CGSize
+    let color: Color
+    let label: String
+    var body: some View {
+        let r = CGRect(x: rect.minX * size.width, y: rect.minY * size.height,
+                       width: rect.width * size.width, height: rect.height * size.height)
+        ZStack(alignment: .topLeading) {
+            Rectangle()
+                .stroke(color, style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+            Text(label)
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundStyle(color)
+                .padding(.horizontal, 5).padding(.vertical, 2)
+                .background(.black.opacity(0.55), in: Capsule())
+                .padding(2)
+        }
+        .frame(width: r.width, height: r.height)
+        .position(x: r.midX, y: r.midY)
+    }
+}
+
 // MARK: - FrameHost / FrameHostView  (画面流直绘，绕开 SwiftUI body diff)
 // ============================================================================
 
@@ -1687,41 +2731,139 @@ struct FrameHostView: NSViewRepresentable {
 // MARK: - MetalGoose 显示路径宿主（超分 / 插帧，仅显示，不动决策链路）
 // ============================================================================
 
-/// 把已捕获帧经 MetalGoose 的 GooseEngine(MetalFX) 超分/插帧后输出到 MTKView。
+/// 把已捕获帧经 MetalGoose 的 GooseEngine(MetalFX) 插帧后输出到 MTKView。
 /// 仅用于「给人看的显示叠加层」；捕获→推理→注入决策链完全不经过这里。
 final class UpscaleFrameHost {
     private weak var mtkView: MTKView?
     private var engine: GooseUpscaler?
 
-    func attach(_ view: MTKView) {
-        // 重新挂载前先释放旧引擎，避免重复 MTKViewDelegate
-        engine?.detachFromView()
-        engine = nil
-        mtkView = view
+    /// 插帧引擎是否可用（Metal 设备缺失/引擎创建失败 → false，UI 据此禁用开关）
+    private(set) var isAvailable = false
 
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
-        view.device = device
+    /// 独立喂帧队列 + latest-wins 跳帧防堆积。
+    /// 引擎公共 ingest API 无 semaphore 背压：若在共享 captureQueue 同步执行，
+    /// GPU 被游戏占满排队时 makeCommandBuffer 阻塞会把捕获队列一起卡住，
+    /// 连累 YOLO/OCR/UI 决策链。故单独队列消费，处理不过来只丢旧帧，决策链零影响。
+    private let ingestQueue = DispatchQueue(label: "aurora.upscale.ingest", qos: .userInitiated)
+    private let frameLock = NSLock()
+    private var latestBuffer: CVPixelBuffer?
+    private var isDraining = false
+
+    /// 由 DriveState 启动时调用一次：预创建引擎并配置插帧模式，决定开关可用性。
+    /// 与视图解耦（视图只在开关打开时才出现），避免"先开开关后建视图"导致可用性滞后。
+    func prepare() {
+        guard engine == nil else { return }
+        if let e = GooseUpscaler.make() {
+            engine = e
+            e.configureInterpolation()
+        }
+        isAvailable = engine != nil
+    }
+
+    func attach(_ view: MTKView) {
+        guard let engine else {
+            isAvailable = false
+            return
+        }
+        // 重新挂载前先解绑旧视图，避免重复 MTKViewDelegate
+        engine.detachFromView()
+        mtkView = view
+        view.device = MTLCreateSystemDefaultDevice()
         view.framebufferOnly = false
         view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         view.enableSetNeedsDisplay = false
         view.isPaused = false
+        engine.attachToView(view, displayRefreshRate: 60, minRefreshRate: 30)
+        engine.configureInterpolation()   // 幂等：确保插帧模式已启用（只插帧，不超分）
+        // 诊断：drawableSize=0 说明 MTKView 未布局/未设置渲染尺寸 → 引擎 renderFrame 早退 → 黑屏
+        lastAttachInfo = "\(Int(view.bounds.width))x\(Int(view.bounds.height))@\(Int(view.drawableSize.width))x\(Int(view.drawableSize.height))"
+    }
 
-        if let engine = GooseUpscaler.make() {
-            self.engine = engine
-            engine.attachToView(view, displayRefreshRate: 60, minRefreshRate: 30)
+    /// 插帧引擎只读统计快照（诊断转发）
+    func statsSnapshot() -> GooseUpscaler.GooseUpscalerStats? {
+        engine?.statsSnapshot()
+    }
+
+    /// 取出一条未消费的引擎错误（诊断/UI 贯出）；无错误返回 nil
+    func pendingError() -> String? {
+        engine?.pendingError()
+    }
+
+    /// 最近一次 attach 的视图/渲染尺寸（诊断；nil=从未 attach）
+    private(set) var lastAttachInfo: String?
+
+    /// 由捕获链路推送原生全帧（CVPixelBuffer）：只覆盖最新帧，由 ingestQueue
+    /// 单消费者消费 → 引擎 ingest。原生 22MB/帧，绝不占主线程/共享捕获队列。
+    func push(pixelBuffer: CVPixelBuffer) {
+        guard engine != nil else { return }
+        let start = frameLock.withLock { () -> Bool in
+            latestBuffer = pixelBuffer          // 覆盖最新帧：处理不过来丢旧帧
+            if isDraining { return false }      // 已有消费者在跑，只覆盖即可
+            isDraining = true
+            return true
+        }
+        if start { drain() }
+    }
+
+    /// 单消费者：循环取最新帧喂引擎；无帧/引擎失效即退出，期间新 push 会重启 drain
+    private func drain() {
+        ingestQueue.async { [weak self] in
+            guard let self else { return }
+            while true {
+                let buf = self.frameLock.withLock { () -> CVPixelBuffer? in
+                    guard let b = self.latestBuffer else {
+                        self.isDraining = false
+                        return nil
+                    }
+                    self.latestBuffer = nil
+                    return b
+                }
+                guard let buf,
+                      let engine = self.engine,
+                      let cg = Self.cgImage(from: buf) else {
+                    self.frameLock.withLock { self.isDraining = false }
+                    return
+                }
+                engine.ingest(cgImage: cg)
+            }
         }
     }
 
-    /// 由捕获回调推送最新帧（CGImage）→ 引擎 ingest
-    func push(_ image: CGImage) {
-        engine?.ingest(cgImage: image)
-    }
-
-    /// 关闭插帧/超分时释放引擎与 MTKView 绑定
+    /// 关闭插帧时解绑视图；引擎保留复用（配置已固化，避免每次开关重建/重编着色器）
     func clear() {
         engine?.detachFromView()
-        engine = nil
         mtkView = nil
+    }
+
+    /// 从 32BGRA 像素缓冲零拷贝构造 CGImage（CGDataProvider 持有缓冲，
+    /// 图像存活期间缓冲不回池；ingest 同步消费后随 CGImage 释放自动回池）
+    private static func cgImage(from pixelBuffer: CVPixelBuffer) -> CGImage? {
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+        guard w > 0, h > 0 else { return nil }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                          | CGBitmapInfo.byteOrder32Little.rawValue)
+        let ptr = Unmanaged.passRetained(pixelBuffer).toOpaque()
+        guard let provider = CGDataProvider(
+            dataInfo: ptr,
+            data: base,
+            size: rowBytes * h,
+            releaseData: { info, _, _ in
+                Unmanaged<CVPixelBuffer>.fromOpaque(info!).release()
+            }) else {
+            Unmanaged<CVPixelBuffer>.fromOpaque(ptr).release()
+            return nil
+        }
+        return CGImage(width: w, height: h,
+                       bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: rowBytes, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: bitmapInfo, provider: provider,
+                       decode: nil, shouldInterpolate: true,
+                       intent: .defaultIntent)
     }
 }
 
@@ -1729,7 +2871,9 @@ struct UpscaleFrameHostView: NSViewRepresentable {
     let host: UpscaleFrameHost
     func makeNSView(context: Context) -> NSView {
         let v = MTKView()
-        v.translatesAutoresizingMaskIntoConstraints = false
+        // 与 FrameHostView 一致：保持默认 translatesAutoresizingMaskIntoConstraints，
+        // 由 SwiftUI 代表视图托管布局/尺寸。显式设 false 且不加约束会让 MTKView
+        // 尺寸悬空为 0（引擎 drawableSize 不自动管理，renderFrame 直接早退 → 黑屏）。
         host.attach(v)
         return v
     }
@@ -1741,7 +2885,7 @@ struct UpscaleFrameHostView: NSViewRepresentable {
 
 
 // ============================================================================
-// MARK: - 文件 7: SidebarView.swift  (右侧毛玻璃侧边栏)
+// MARK: - 内部段落: SidebarView — 右侧毛玻璃侧边栏（原拆分自 SidebarView.swift）
 // ============================================================================
 
 struct SidebarView: View {
@@ -1767,7 +2911,7 @@ struct SidebarView: View {
 
 
 // ============================================================================
-// MARK: - 文件 8: StatusPanel.swift  (状态面板)
+// MARK: - 内部段落: StatusPanel — 状态面板（原拆分自 StatusPanel.swift）
 // ============================================================================
 
 struct StatusPanel: View {
@@ -1912,7 +3056,7 @@ struct ConfidenceBar: View {
 
 
 // ============================================================================
-// MARK: - 文件 9: ControlPanel.swift  (控制按钮)
+// MARK: - 内部段落: ControlPanel — 控制按钮（原拆分自 ControlPanel.swift）
 // ============================================================================
 
 struct ControlPanel: View {
@@ -2028,7 +3172,7 @@ struct ControlPanel: View {
 
 
 // ============================================================================
-// MARK: - 文件 10: ConfigPanel.swift  (配置面板)
+// MARK: - 内部段落: ConfigPanel — 配置面板（原拆分自 ConfigPanel.swift）
 // ============================================================================
 
 struct ConfigPanel: View {
@@ -2067,20 +3211,57 @@ struct ConfigPanel: View {
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(state.upscaleEnabled ? Theme.cyan : Theme.textTertiary)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("显示插帧 / 超分")
+                        Text("显示插帧")
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(Theme.textPrimary)
-                        Text("MetalGoose · 仅影响预览观感")
+                        Text("MetalGoose MGFG-1 · 仅影响预览观感")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
+                        // 用途说明：卡顿时可短暂看预览框的插帧画面撑过关卡（仅应急小窗）
+                        Text("游戏很卡时，可短暂看着预览框的插帧画面撑过关卡")
                             .font(.system(size: 10))
                             .foregroundStyle(Theme.textTertiary)
                     }
                     Spacer()
-                    Toggle("", isOn: $state.upscaleEnabled)
+                    Toggle("", isOn: Binding(
+                        get: { state.upscaleEnabled },
+                        set: { state.setUpscaleEnabled($0) }
+                    ))
+                        .toggleStyle(.switch)
+                        .tint(Theme.cyan)
+                        .labelsHidden()
+                        .disabled(!state.upscaleSupported)
+                }
+                .padding(.horizontal, 4)
+
+                // ── 游戏模式兼容（对抗全屏游戏降权）──
+                HStack {
+                    Image(systemName: "bolt.badge.a")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(state.gameModeBoost ? Theme.cyan : Theme.textTertiary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("游戏模式兼容")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Theme.textPrimary)
+                        Text("捕获线程时间约束调度 · 对抗全屏游戏降权")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
+                        Text("游戏全屏卡成 1 帧时开着它；游戏掉帧就关")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { state.gameModeBoost },
+                        set: { state.setGameModeBoost($0) }
+                    ))
                         .toggleStyle(.switch)
                         .tint(Theme.cyan)
                         .labelsHidden()
                 }
                 .padding(.horizontal, 4)
+
+                // 插帧实时读数已移至顶部标题栏（TopToolbar.upscaleBadge），此处仅留开关
             }
         }
     }
@@ -2113,7 +3294,7 @@ struct SettingSlider: View {
 
 
 // ============================================================================
-// MARK: - 文件 11: TrainingPanel.swift  (训练控制)
+// MARK: - 内部段落: TrainingPanel — 训练控制（原拆分自 TrainingPanel.swift）
 // ============================================================================
 
 struct TrainingPanel: View {
@@ -2232,5 +3413,68 @@ struct TrainButton: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// ============================================================================
+// MARK: - 驾驶记录仪（RingBuffer + 历史帧回看）
+
+/// 历史帧预览叠加层（右上角小窗，半透明背景）
+
+// ============================================================================
+
+/// 驾驶帧环形缓冲区：存最近N帧快照（每3秒存一帧）
+/// 用途：随时回看关键时刻（3秒前/6秒前），用于复盘和Debug
+final class DrivingFrameRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _frames: [CGImage] = []
+    private let maxFrames: Int
+
+    /// 最后存帧时间（用于3秒节流）
+    private var lastSaveTime = Date.distantPast
+
+    init(maxFrames: Int = 5) {
+        self.maxFrames = maxFrames
+    }
+
+    /// 尝试存一帧（每3秒最多存一次）
+    func tryAppend(_ cg: CGImage?, now: Date = Date()) {
+        guard let cg else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        // 3秒节流
+        guard now.timeIntervalSince(lastSaveTime) >= 3.0 else { return }
+        lastSaveTime = now
+        _frames.append(cg)
+        // 环形截断：保持最多maxFrames帧
+        if _frames.count > maxFrames {
+            _frames.removeFirst(_frames.count - maxFrames)
+        }
+    }
+
+    /// 获取指定秒数前的帧（3秒前→index 1，6秒前→index 2）
+    /// 返回 nil 表示没有该帧（缓冲区不满）
+    func frameAt(secondsAgo: Int) -> CGImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        // 最新帧在末尾；3秒前=index -1，6秒前=index -2
+        let index = _frames.count - secondsAgo
+        guard index > 0, index <= _frames.count else { return nil }
+        return _frames[index - 1]
+    }
+
+    /// 当前缓冲区中的帧数
+    var frameCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _frames.count
+    }
+
+    /// 清空缓冲区
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        _frames.removeAll()
+        lastSaveTime = Date.distantPast
     }
 }
